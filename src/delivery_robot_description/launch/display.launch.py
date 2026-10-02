@@ -1,66 +1,51 @@
-import os
-
-from ament_index_python.packages import get_package_share_directory
-
 from launch import LaunchDescription
 from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+
+import os
 
 
 def generate_launch_description():
 
-    # Đường dẫn tới package
-    package_path = get_package_share_directory(
-        'delivery_robot_description'
-    )
+    package_name = 'delivery_robot_description'
 
-    # Đường dẫn tới file URDF
+    package_path = get_package_share_directory(package_name)
+
     urdf_path = os.path.join(
         package_path,
         'urdf',
-        'robot_Ros_main.urdf'
+        'delivery_car_robot.urdf'
     )
 
-    # Đọc nội dung URDF
     with open(urdf_path, 'r') as file:
         robot_description = file.read()
 
-    # Robot State Publisher
-    robot_state_publisher_node = Node(
+    robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         name='robot_state_publisher',
         output='screen',
         parameters=[
-            {
-                'robot_description': robot_description,
-                'use_sim_time': False
-            }
+            {'robot_description': robot_description}
         ]
     )
 
-    # Joint State Publisher GUI
-    joint_state_publisher_gui_node = Node(
+    joint_state_publisher_gui = Node(
         package='joint_state_publisher_gui',
         executable='joint_state_publisher_gui',
         name='joint_state_publisher_gui',
         output='screen'
     )
 
-    rviz_config_path = os.path.join(
-        package_path,
-        'rviz',
-        'display.rviz'
-    )
-
-    rviz_node = Node(
+    rviz = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
-        output='screen',
-        arguments=['-d', rviz_config_path]
+        output='screen'
     )
+
     return LaunchDescription([
-        robot_state_publisher_node,
-        joint_state_publisher_gui_node,
-        rviz_node
+        robot_state_publisher,
+        joint_state_publisher_gui,
+        rviz
     ])
