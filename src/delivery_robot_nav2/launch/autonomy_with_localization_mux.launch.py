@@ -1,0 +1,29 @@
+import os
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from ament_index_python.packages import get_package_share_directory
+
+
+def _include(package, launch_filename, arguments=None):
+    path = os.path.join(get_package_share_directory(package), 'launch', launch_filename)
+    return IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(path),
+        launch_arguments=(arguments or {}).items(),
+    )
+
+
+def generate_launch_description():
+    actions = [
+        LogInfo(msg='AUTONOMY + LOCALIZATION - MUX: /cmd_vel output (Mux begins STOP); do not run parallel Nav2/localization/Web Bridge instances'),
+    ]
+    actions.append(DeclareLaunchArgument('map', description='Full path to saved map YAML'))
+    actions.append(_include(
+        'delivery_robot_localization_v14', 'amcl_localization.launch.py',
+        {'map': LaunchConfiguration('map')},
+    ))
+    actions.append(_include('delivery_robot_nav2', 'navigation_integrated_mux.launch.py'))
+    actions.append(_include('delivery_robot_mission', 'mission_manager.launch.py'))
+    actions.append(_include('delivery_robot_web_bridge', 'web_bridge.launch.py'))
+    return LaunchDescription(actions)

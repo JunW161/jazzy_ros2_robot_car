@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>delivery_robot_localization_v14</name>
+  <version>0.1.0</version>
+  <description>Official local odometry ownership using validated V14 EKF, plus Nav2 AMCL static-map localization for Robot_Delivery_V12.</description>
+  <maintainer email="robot@local.invalid">Delivery Robot Project</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>delivery_robot_sensor_fusion_v14</exec_depend>
+  <exec_depend>robot_localization</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav2_amcl</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

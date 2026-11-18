@@ -1,0 +1,14 @@
+{
+  "ros_workspace": "/home/tuan/ros2_ws",
+  "motor_project": "/home/tuan/micro_ros_ws/micro_ros_espidf_component/examples/robot_motor_control",
+  "description_urdf": "/home/tuan/ros2_ws/src/delivery_robot_description/urdf/delivery_car_robot.urdf",
+  "agent_backend": "docker_exact_helper",
+  "control_profile_version": 22,
+  "wheel_radius_m": 0.044,
+  "wheel_track_m": 0.195,
+  "manual_max_wheel_rpm": 40.0,
+  "manual_straight_rpm": 40.0,
+  "manual_turn_rpm": 20.0,
+  "max_linear": 0.18430676901060117,
+  "max_angular": 1.8903258360061657
+}

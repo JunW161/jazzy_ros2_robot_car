@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.8)
+project(delivery_robot_sensor_fusion_v6)
+find_package(ament_cmake REQUIRED)
+install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
+ament_package()

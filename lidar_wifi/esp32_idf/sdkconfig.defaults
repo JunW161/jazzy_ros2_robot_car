@@ -1,0 +1,3 @@
+CONFIG_IDF_TARGET="esp32s3"
+# WIFI SSID/PASSWORD are deliberately not embedded in this distributed project.
+# idf.py menuconfig -> LD14P Wi-Fi Bridge

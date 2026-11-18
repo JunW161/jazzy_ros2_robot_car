@@ -1,0 +1,26 @@
+menu "LD14P Wi-Fi Bridge"
+    config LIDAR_WIFI_SSID
+        string "Wi-Fi SSID (2.4 GHz)"
+        default ""
+        help
+            Must be the name of the 2.4GHz AP to which Ubuntu also has LAN access.
+
+    config LIDAR_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            Store locally in sdkconfig. Do not publish this file with credentials.
+
+    config LIDAR_TCP_PORT
+        int "TCP server port for raw LD14P byte stream"
+        range 1024 65535
+        default 7777
+
+    config LIDAR_UART_BAUD
+        int "LD14P UART1 RX baud rate (GPIO16)"
+        range 9600 921600
+        default 115200
+        help
+            Kept at 115200 because user's currently working ld14_usb_bridge/main.c
+            uses 115200 on UART1. Change only after physical verification.
+endmenu

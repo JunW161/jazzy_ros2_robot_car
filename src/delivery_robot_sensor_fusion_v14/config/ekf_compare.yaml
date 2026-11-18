@@ -1,0 +1,64 @@
+ekf_filter_node_v14:
+  ros__parameters:
+    # Current measured robot rates: /odom ~9.5-10 Hz, /imu/data_raw ~34 Hz.
+    frequency: 30.0
+    sensor_timeout: 0.25
+    two_d_mode: true
+
+    # SAFE COMPARISON MODE. odom_tf_joint_bridge.py remains TF owner.
+    publish_tf: false
+    publish_acceleration: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    print_diagnostics: true
+    debug: false
+    use_control: false
+    transform_time_offset: 0.0
+    transform_timeout: 0.05
+    predict_to_current_time: true
+    smooth_lagged_data: false
+
+    # V14: scale pose process noise with robot velocity. At rest this reduces
+    # artificial growth of pose covariance; while moving the filter still
+    # allows pose uncertainty to evolve.
+    dynamic_process_noise_covariance: true
+
+    # Diagonal Q order:
+    # x,y,z,roll,pitch,yaw,vx,vy,vz,vroll,vpitch,vyaw,ax,ay,az
+    # Tuned conservatively from V13 observations. Measurement covariances in
+    # /odom and /imu are NOT altered by this package.
+    process_noise_covariance: [0.020, 0.010, 0.001,
+                               0.001, 0.001, 0.010,
+                               0.020, 0.005, 0.001,
+                               0.001, 0.001, 0.003,
+                               0.005, 0.005, 0.005]
+
+    # Wheel odometry: use forward velocity plus the measured vy=0
+    # non-holonomic constraint. Do not double-count encoder-derived pose/yaw.
+    # x,y,z,roll,pitch,yaw,vx,vy,vz,vroll,vpitch,vyaw,ax,ay,az
+    odom0: /odom
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  true,  false,
+                   false, false, false,
+                   false, false, false]
+    odom0_queue_size: 20
+    odom0_differential: false
+    odom0_relative: false
+
+    # MPU-6500 has no valid absolute orientation in current firmware.
+    # Fuse angular_velocity.z only.
+    imu0: /imu/data_raw
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_queue_size: 50
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: false

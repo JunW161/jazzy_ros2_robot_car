@@ -1,0 +1,41 @@
+collision_monitor:
+  ros__parameters:
+    use_sim_time: false
+    enabled: true
+    base_frame_id: base_link
+    odom_frame_id: odom
+    cmd_vel_in_topic: cmd_vel_smoothed
+    cmd_vel_out_topic: cmd_vel_nav_test
+    state_topic: collision_monitor_state
+    transform_tolerance: 0.20
+    source_timeout: 0.70
+    base_shift_correction: true
+    stop_pub_timeout: 1.0
+    enable_stamped_cmd_vel: false
+
+    polygons: ["StopCircle", "SlowFront"]
+
+    StopCircle:
+      type: "circle"
+      radius: 0.25
+      action_type: "stop"
+      min_points: 3
+      visualize: true
+      polygon_pub_topic: collision_stop_zone
+      enabled: true
+
+    SlowFront:
+      type: "polygon"
+      points: "[[0.55, 0.28], [0.55, -0.28], [-0.10, -0.28], [-0.10, 0.28]]"
+      action_type: "slowdown"
+      min_points: 3
+      slowdown_ratio: 0.75
+      visualize: true
+      polygon_pub_topic: collision_slow_zone
+      enabled: true
+
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: /scan
+      enabled: true

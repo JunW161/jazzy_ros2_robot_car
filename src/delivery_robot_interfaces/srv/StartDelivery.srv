@@ -1,0 +1,10 @@
+string pickup_name
+geometry_msgs/PoseStamped pickup_pose
+string dropoff_name
+geometry_msgs/PoseStamped dropoff_pose
+bool require_pickup_confirmation
+bool require_dropoff_confirmation
+---
+bool accepted
+string mission_id
+string message

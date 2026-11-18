@@ -1,0 +1,25 @@
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odometry/filtered
+    transform_tolerance: 0.20
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    default_cancel_timeout: 20
+    always_reload_bt_xml: false
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+      enable_groot_monitoring: false
+      groot_server_port: 1667
+
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+      enable_groot_monitoring: false
+      groot_server_port: 1669
+
+    # Jazzy loads built-in Nav2 BT node libraries automatically.
+    plugin_lib_names: []

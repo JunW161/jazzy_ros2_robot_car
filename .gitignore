@@ -9,3 +9,29 @@ __pycache__/
 *.pyc
 *.swp
 *~
+# ROS 2 and ESP-IDF generated files
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+sdkconfig
+sdkconfig.old
+
+# Credentials and private configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Temporary files
+*.swp
+*.bak_*
+*.backup*
+*.db3
+*.mcap

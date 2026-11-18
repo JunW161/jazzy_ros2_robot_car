@@ -1,0 +1,8 @@
+{
+  "version": 4,
+  "technical_source": "map.yaml interpreted with occupancy thresholds",
+  "clean_visual_only": true,
+  "changed_cells": 71,
+  "total_cells": 14896,
+  "navigation_map_modified": false
+}
