@@ -1,4 +1,0 @@
-<?xml version="1.0"?>
-<package format="3"><name>delivery_robot_sensor_fusion_v8</name><version>0.1.0</version>
-<description>Non-invasive wheel odometry and MPU6500 EKF fusion for ROS2 Jazzy</description><maintainer email="robot@local.invalid">Delivery Robot Project</maintainer><license>MIT</license>
-<buildtool_depend>ament_cmake</buildtool_depend><exec_depend>robot_localization</exec_depend><exec_depend>tf2_ros</exec_depend><export><build_type>ament_cmake</build_type></export></package>
