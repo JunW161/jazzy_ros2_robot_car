@@ -93,6 +93,12 @@ class Store:
                 x REAL NOT NULL, y REAL NOT NULL, yaw REAL NOT NULL, note TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,
                 stamp REAL NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS delivery_history(
+                mission_id TEXT PRIMARY KEY, map_id TEXT NOT NULL, map_name TEXT NOT NULL,
+                pickup_id TEXT NOT NULL, dropoff_id TEXT NOT NULL,
+                pickup_name TEXT NOT NULL, dropoff_name TEXT NOT NULL,
+                state_name TEXT NOT NULL, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL, message TEXT NOT NULL);
         ''')
         self.db.commit()
         os.chmod(self.root / 'app.sqlite3', 0o600)
@@ -105,6 +111,12 @@ class Store:
             self.config.update(json.loads(self.config_path.read_text()))
         else:
             self.save_config({})
+        # Upgrade the old direct-motor Web route to the established command mux.
+        # Preserve all user paths, network settings, geometry, maps and accounts.
+        if self.config.get('cmd_topic') == '/cmd_vel':
+            self.config['cmd_topic'] = '/cmd_vel_manual'
+            self.save_config({})
+            self.audit('configuration_migrated', 'Web manual output: /cmd_vel_manual')
 
     def save_config(self, updates: dict[str, Any]):
         # Only this allowlist is editable via HTTP; paths/frames are local-admin config.
@@ -236,6 +248,65 @@ class Store:
         with self.lock:
             self.db.execute('DELETE FROM points WHERE id=? AND map_id=?', (point_id, ident))
             self.db.commit()
+
+    def point(self, ident: str, point_id: str):
+        self.map(ident)
+        with self.lock:
+            row = self.db.execute('SELECT * FROM points WHERE id=? AND map_id=?',
+                                  (point_id, ident)).fetchone()
+        if row is None:
+            raise UserError('Không tìm thấy điểm trong bản đồ đã chọn.')
+        return dict(row)
+
+    def record_delivery(self, mission_id: str, record: dict, pickup: dict, dropoff: dict):
+        now = time.time()
+        with self.lock:
+            self.db.execute('''INSERT INTO delivery_history VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                (mission_id, record['id'], record['name'], pickup['id'], dropoff['id'],
+                 pickup['name'], dropoff['name'], 'GOING_TO_PICKUP', now, now,
+                 'Mission Manager đã nhận nhiệm vụ.'))
+            self.db.commit()
+
+    def observe_delivery(self, mission: dict):
+        """Persist real state transitions, never infer success from time or lost feedback."""
+        ident = mission.get('id') or mission.get('mission_id')
+        if not ident or not mission.get('available'):
+            return
+        age = mission.get('receive_age')
+        if age is None or age > 3.0:
+            return
+        state = str(mission.get('state_name', 'UNKNOWN'))
+        message = str(mission.get('message', ''))[:1000]
+        with self.lock:
+            row = self.db.execute('SELECT state_name,message FROM delivery_history WHERE mission_id=?',
+                                  (ident,)).fetchone()
+            if row and (row['state_name'] != state or row['message'] != message):
+                self.db.execute('UPDATE delivery_history SET state_name=?,message=?,updated_at=? WHERE mission_id=?',
+                                (state, message, time.time(), ident))
+                self.db.commit()
+
+    def interrupt_delivery(self, mission: dict):
+        """Record a verified owned Mission Manager shutdown, without a fake heartbeat.
+
+        Only ProcessManager calls this after its child process group has exited.
+        Normal feedback still goes through observe_delivery's freshness checks.
+        """
+        ident = mission.get('id') or mission.get('mission_id')
+        if not ident or mission.get('state_name') != 'ERROR':
+            return
+        message = str(mission.get('message') or 'Mission Manager đã đóng; nhiệm vụ bị gián đoạn.')[:1000]
+        with self.lock:
+            self.db.execute('''UPDATE delivery_history SET state_name='ERROR',message=?,updated_at=?
+                WHERE mission_id=? AND state_name IN
+                ('GOING_TO_PICKUP','WAITING_PICKUP','GOING_TO_DROPOFF','WAITING_DROPOFF')''',
+                (message, time.time(), ident))
+            self.db.commit()
+
+    def delivery_history(self, limit: int = 50):
+        limit = max(1, min(200, int(limit)))
+        with self.lock:
+            return [dict(r) for r in self.db.execute(
+                'SELECT * FROM delivery_history ORDER BY created_at DESC LIMIT ?', (limit,))]
 
 
 class MotionLease:

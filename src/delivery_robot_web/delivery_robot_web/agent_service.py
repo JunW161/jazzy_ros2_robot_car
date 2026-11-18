@@ -48,7 +48,7 @@ class AgentService:
                 'active_state': 'not-installed', 'sub_state': '', 'pid': 0,
                 'port': int(self.config.get('agent_port', 8888)),
                 'domain_id': int(os.environ.get('ROS_DOMAIN_ID', '0')),
-                'message': '',
+                'message': '', 'status_known': False,
             }
             if not value['installed']:
                 value['message'] = 'Chưa cài helper Agent. Chạy SETUP_AGENT_WEB_HELPER.sh một lần.'
@@ -58,6 +58,7 @@ class AgentService:
                     running = p.returncode == 0 and 'RUNNING' in p.stdout
                     value.update(
                         running=running,
+                        status_known=p.returncode in (0, 3),
                         active_state='active' if running else 'inactive',
                         sub_state='running' if running else 'dead',
                         message=(
@@ -66,6 +67,7 @@ class AgentService:
                         ),
                     )
                     if p.returncode not in (0, 3):
+                        value.update(active_state='unknown', sub_state='unknown')
                         value['message'] = (p.stderr or p.stdout).strip()[-1200:]
                 except UserError as exc:
                     value['message'] = str(exc)
@@ -76,6 +78,8 @@ class AgentService:
         info = self.snapshot(fresh=True)
         if not info['installed']:
             raise UserError(info['message'])
+        if not info.get('status_known', True):
+            raise UserError('Chưa xác định được trạng thái Agent. ' + info.get('message', ''))
         if int(self.config.get('agent_port', 8888)) != 8888:
             raise UserError('Web V2.5 Map V4 dùng đúng Agent đã kiểm chứng ở UDP 8888. Đặt agent_port về 8888.')
         if int(os.environ.get('ROS_DOMAIN_ID', '0')) != 0:
@@ -103,12 +107,16 @@ class AgentService:
         info = self.snapshot(fresh=True)
         if not info['installed']:
             raise UserError(info['message'])
-        if not info['running']:
+        if info.get('status_known', True) and not info['running']:
             return 'Agent Docker đã dừng.'
         p = self._run('stop', timeout=12)
         self._at = 0
         if p.returncode:
             raise UserError('Không dừng được Agent Docker. ' + (p.stderr or p.stdout).strip()[-1500:])
+        verified = self.snapshot(fresh=True)
+        if not verified.get('status_known', True) or verified.get('running'):
+            raise UserError('Đã gửi lệnh dừng nhưng chưa xác nhận Agent Docker đã dừng. ' +
+                            verified.get('message', ''))
         return 'Đã dừng Agent Docker do web quản lý.'
 
     def log(self):

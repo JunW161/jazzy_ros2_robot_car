@@ -6,6 +6,7 @@ SLAM and saved-map Localization (Map Server + AMCL) are mutually exclusive actio
 """
 from __future__ import annotations
 import os
+import math
 import shlex
 import signal
 import socket
@@ -18,6 +19,38 @@ from .core import UserError
 from .agent_service import AgentService
 
 
+NAVIGATION_NODES = (
+    '/planner_server', '/controller_server', '/behavior_server', '/bt_navigator',
+    '/waypoint_follower', '/velocity_smoother', '/collision_monitor',
+)
+FOUNDATION_COMPONENTS = ('agent', 'odom_bridge', 'ekf_odom', 'robot_model', 'lidar',
+                         'localization', 'slam', 'costmap')
+STOP_ORDER = ('mission', 'navigation', 'cmd_mux', 'rviz', 'costmap', 'localization', 'slam',
+              'lidar', 'robot_model', 'ekf_odom', 'odom_bridge', 'agent')
+COMPONENT_NODES = {
+    'navigation': NAVIGATION_NODES + ('/delivery_robot_cmd_mux',
+        '/global_costmap/global_costmap', '/local_costmap/local_costmap'),
+    'mission': ('/delivery_robot_mission_manager',),
+    'cmd_mux': ('/delivery_robot_cmd_mux',),
+    'costmap': ('/global_costmap/global_costmap', '/local_costmap/local_costmap'),
+    'localization': ('/amcl', '/map_server', '/lifecycle_manager_localization'),
+    'slam': ('/slam_toolbox',), 'lidar': ('/ldlidar_publisher_ld14',),
+    'robot_model': ('/robot_state_publisher',), 'ekf_odom': ('/ekf_filter_node_v14',),
+    'odom_bridge': ('/delivery_odom_tf_joint_bridge',), 'rviz': ('/rviz2',),
+}
+DEPENDENTS = {
+    'navigation': ('mission',), 'cmd_mux': ('mission', 'navigation'),
+    'costmap': ('mission', 'navigation'),
+    'localization': ('mission', 'navigation', 'costmap'),
+    'slam': (),
+    'lidar': ('mission', 'navigation', 'rviz', 'costmap', 'localization', 'slam'),
+    'robot_model': ('mission', 'navigation', 'rviz', 'costmap', 'localization', 'slam'),
+    'ekf_odom': ('mission', 'navigation', 'rviz', 'costmap', 'localization', 'slam'),
+    'odom_bridge': ('mission', 'navigation', 'rviz', 'costmap', 'localization', 'slam'),
+    'agent': STOP_ORDER[:-1],
+}
+
+
 class ProcessManager:
     def __init__(self, store, ros, offline=False):
         self.store, self.ros, self.offline = store, ros, offline
@@ -25,6 +58,330 @@ class ProcessManager:
         self.children = {}
         self.agent = AgentService(store.config)
         self.agent_started = False
+        self.operations = {}
+        self.failures = {}
+        self.closing = False
+        self._discovery_cache = {}
+        self.stop_lock = threading.RLock()
+        self.confirmed_stops = set()
+
+    def _owned_live(self, name):
+        if name == 'agent':
+            return self.agent_started
+        with self.lock:
+            item = self.children.get(name)
+        return bool(item and (item['process'].poll() is None or
+                             self._owned_group_running(item['process'].pid)))
+
+    def _reset_after_stop(self, name):
+        with self.lock:
+            self.confirmed_stops.add(name)
+            if name == 'navigation':
+                self.confirmed_stops.update(('cmd_mux', 'costmap'))
+            self.failures.pop(name, None)
+            self._discovery_cache.clear()
+        reset = getattr(self.ros, 'reset_observations', None)
+        if reset is not None:
+            reset([name])
+
+    def _new_owner_started(self, name, restart_required):
+        """A successful replacement may legitimately reuse its old DDS identity."""
+        if restart_required:
+            resume = getattr(self.ros, 'managed_start_complete', None)
+            if resume is not None:
+                resume([name])
+        with self.lock:
+            self.confirmed_stops.discard(name)
+            if name == 'navigation':
+                self.confirmed_stops.difference_update(('cmd_mux', 'costmap'))
+
+    def _state_for_process_checks(self):
+        """Do not turn a verified dead local process back into a DDS owner.
+
+        A genuine matching local process still blocks duplicate startup. ROS
+        readiness separately requires new data, so this only removes stale
+        process-existence gates, never upgrades a sensor/TF to healthy.
+        """
+        state = dict(self.ros.status())
+        nodes = list(state.get('nodes', []))
+        with self.lock:
+            stopped = tuple(self.confirmed_stops)
+        for name in stopped:
+            if self._owned_live(name):
+                continue
+            if name in ('navigation', 'mission', 'cmd_mux'):
+                matches = self._autonomy_processes(name)
+            elif name == 'localization':
+                matches = self.recoverable_localization_processes()
+            elif name == 'costmap':
+                matches = self.recoverable_costmap_processes()
+            else:
+                matches = self.recoverable_base_processes(name) if name != 'agent' else []
+            if matches:
+                continue
+            retired = COMPONENT_NODES.get(name, ())
+            nodes = [node for node in nodes if node not in retired]
+            if name == 'lidar':
+                state['scan_publishers'] = 0
+            elif name == 'agent':
+                state['odom_publishers'] = 0
+            elif name in ('costmap', 'navigation'):
+                state['global_costmap_publishers'] = state['local_costmap_publishers'] = 0
+        state['nodes'] = nodes
+        return state
+
+    def _emit_progress(self, progress, row):
+        if progress is not None:
+            try:
+                progress(dict(row))
+            except Exception:
+                # UI observer failure must not interrupt process teardown.
+                pass
+
+    def _navigation_snapshot(self):
+        navigation = getattr(self.ros, 'navigation', None)
+        if navigation is None:
+            return {}
+        try:
+            return navigation.snapshot()
+        except Exception:
+            # A disconnected observation must never be promoted to READY.
+            return {}
+
+    def _autonomy_processes(self, name):
+        """Read-only discovery; matching a command never establishes ownership."""
+        now = time.monotonic()
+        with self.lock:
+            cached = self._discovery_cache.get(name)
+            if cached and now - cached[0] < 0.5:
+                return list(cached[1])
+        if name == 'cmd_mux':
+            needles = ('/delivery_robot_cmd_mux/cmd_mux',
+                       'ros2 launch delivery_robot_cmd_mux cmd_mux.launch.py')
+        else:
+            needles = (
+            ('navigation_integrated_mux.launch.py',
+             '/nav2_controller/controller_server', '/nav2_planner/planner_server',
+             '/nav2_bt_navigator/bt_navigator',
+             '/nav2_behaviors/behavior_server',
+             '/nav2_waypoint_follower/waypoint_follower',
+             '/nav2_velocity_smoother/velocity_smoother',
+             '/nav2_collision_monitor/collision_monitor') if name == 'navigation' else
+            ('/delivery_robot_mission/mission_manager',
+             'ros2 launch delivery_robot_mission mission_manager.launch.py')
+            )
+        found = {}
+        for needle in needles:
+            for item in self.local_process_matches(needle):
+                found[item['pid']] = item
+        values = list(found.values())
+        with self.lock:
+            self._discovery_cache[name] = (now, values)
+        return list(values)
+
+    def _autonomy_status(self, state=None):
+        state = self._state_for_process_checks() if state is None else state
+        nodes = state.get('nodes', [])
+        snapshot = self._navigation_snapshot()
+        result = {}
+        with self.lock:
+            children = dict(self.children)
+            operations = dict(self.operations)
+            failures = dict(self.failures)
+        for name in ('navigation', 'mission', 'cmd_mux'):
+            item = children.get(name)
+            code = item['process'].poll() if item else None
+            orphaned = bool(item and code is not None and self._owned_group_running(item['process'].pid))
+            owned = bool(item and (code is None or orphaned))
+            matches = [] if self.offline else self._autonomy_processes(name)
+            expected = (NAVIGATION_NODES if name == 'navigation' else
+                        ('/delivery_robot_mission_manager',) if name == 'mission' else
+                        ('/delivery_robot_cmd_mux',))
+            observed = [node for node in expected if node in nodes]
+            mux_present = '/delivery_robot_cmd_mux' in nodes
+            present = owned or bool(matches or observed)
+            external = present and not owned
+            if name == 'navigation':
+                ready = bool(snapshot.get('ready')) and present
+                complete = all(nodes.count(node) == 1 for node in NAVIGATION_NODES) and nodes.count('/delivery_robot_cmd_mux') == 1
+            elif name == 'mission':
+                mission = snapshot.get('mission') or {}
+                age = mission.get('receive_age')
+                ready = bool(mission.get('available')) and (age is None or age < 2.5) and present
+                complete = bool(observed)
+            else:
+                mux = snapshot.get('mux') or {}
+                age = mux.get('receive_age', mux.get('age'))
+                ready = bool(mux.get('available')) and (age is None or age < 2.5) and present
+                complete = nodes.count('/delivery_robot_cmd_mux') == 1
+            # Surviving children remain ours after their launch parent exits.
+            # Even healthy ROS observations cannot make a broken launch ready.
+            ready = ready and not orphaned and name not in failures
+            if name in operations:
+                status = operations[name]
+            elif orphaned or failures.get(name):
+                status = 'failed'
+            elif present:
+                status = 'external' if external else ('ready' if ready else 'starting')
+                if owned and not ready and time.monotonic() - item.get('started_at', time.monotonic()) > 30:
+                    status = 'degraded'
+            elif failures.get(name) or (item and code not in (None, 0)):
+                status = 'failed'
+            else:
+                status = 'stopped'
+            if orphaned:
+                message = ('Tiến trình launch đã thoát nhưng còn tiến trình con do Web sở hữu. '
+                           'Dừng thành phần này trên Web trước khi khởi động lại.')
+            elif failures.get(name) and owned:
+                message = failures[name]
+            elif external:
+                message = ('Đang chạy ngoài phiên Web này; Web quan sát và gửi yêu cầu ROS, '
+                           'không sở hữu tiến trình. Dừng launch tại nơi đã mở.')
+                if not complete:
+                    message += ' Chỉ thấy một phần stack; không mở thêm bản trùng.'
+            elif ready:
+                message = 'Đã xác nhận dữ liệu/trạng thái ROS sẵn sàng.'
+            elif owned:
+                message = 'Tiến trình đã mở; đang chờ các node và dịch vụ sẵn sàng.'
+            else:
+                message = failures.get(name) or 'Chưa khởi động.'
+            recoverable = [m for m in matches if self._project_identity_matches(name, m)]
+            if external and recoverable:
+                message = 'Tiến trình dự án đã được xác minh; có thể dừng từ Web.'
+            result[name] = {
+                'running': present, 'managed': owned, 'external': external,
+                'recoverable': bool(recoverable) and not owned, 'ready': ready, 'status': status,
+                'complete': complete, 'message': message,
+                'pid': item['process'].pid if owned else (matches[0]['pid'] if matches else None),
+                'returncode': code, 'orphaned': orphaned, 'context': dict(item.get('context', {})) if item else {},
+            }
+        if result['cmd_mux']['running'] and result['navigation']['running'] and not result['cmd_mux']['managed']:
+            result['cmd_mux']['context']['provided_by'] = 'navigation'
+            result['cmd_mux']['message'] = 'Command mux nằm trong stack Navigation; dừng bằng thao tác Navigation.'
+        return result
+
+    def navigation_present(self):
+        return self._autonomy_status()['navigation']['running']
+
+    def _require_navigation_stopped(self, operation):
+        if self.navigation_present():
+            raise UserError('Dừng Navigation trước khi ' + operation + '. '
+                            'Navigation chạy ngoài Web phải được dừng tại Terminal đã mở.')
+
+    @staticmethod
+    def _fresh_age(value, minimum=-0.75, maximum=1.0):
+        return isinstance(value, (int, float)) and math.isfinite(value) and minimum <= value < maximum
+
+    def _navigation_preflight(self, state):
+        issues = []
+        nodes = state.get('nodes', [])
+        if '/slam_toolbox' in nodes:
+            issues.append('Dừng SLAM và bật định vị trên bản đồ đã lưu.')
+        if nodes.count('/amcl') != 1:
+            issues.append('Cần đúng một AMCL đang chạy.')
+        for field, label in (('tf_odom', 'odom→base_link'), ('tf_map', 'map→base_link')):
+            if not self._fresh_age((state.get(field) or {}).get('age')):
+                issues.append('Chưa có TF ' + label + ' mới; kiểm tra định vị/Initial Pose.')
+        if state.get('scan_publishers') != 1 or not self._fresh_age(
+                (state.get('scan') or {}).get('receive_age'), minimum=0.0, maximum=0.7):
+            issues.append('Cần đúng một nguồn LiDAR và dữ liệu /scan mới.')
+        if state.get('odom_publishers') != 1 or not self._fresh_age(
+                (state.get('odom') or {}).get('receive_age'), minimum=0.0, maximum=0.5):
+            issues.append('Cần đúng một nguồn odometry và dữ liệu encoder mới.')
+        if not state.get('tf_odom_laser'):
+            issues.append('Thiếu TF giữa robot và LiDAR.')
+        if issues:
+            raise UserError('Chưa khởi động Navigation: ' + ' '.join(issues))
+
+    def _start_autonomy(self, name, cancel_event=None):
+        """Reserve the component briefly; process startup never holds the status lock."""
+        with self.lock:
+            if self.closing or (cancel_event is not None and cancel_event.is_set()):
+                raise UserError('Web đang đóng; không khởi động thêm tiến trình.')
+            existing = self.children.get(name)
+            if existing and existing['process'].poll() is None:
+                return {'message': 'Đã chạy bởi Web; không mở bản trùng.', 'managed': True}
+            if existing and self._owned_group_running(existing['process'].pid):
+                raise UserError('Launch ' + name + ' đã thoát nhưng còn tiến trình con do Web sở hữu. '
+                                'Dừng thành phần này trên Web trước khi khởi động lại.')
+            if self.operations.get(name):
+                raise UserError('Đang xử lý ' + name + '; chờ thao tác hiện tại hoàn tất.')
+            self.operations[name] = 'starting'
+            self.failures.pop(name, None)
+            self._discovery_cache.clear()
+        try:
+            state = self._state_for_process_checks()
+            observed = self._autonomy_status(state)[name]
+            if observed['running']:
+                if observed['managed']:
+                    raise UserError('Còn tiến trình con do Web sở hữu; dừng thành phần trước khi khởi động lại.')
+                if observed['complete']:
+                    return {'message': observed['message'], 'external': True, 'managed': False}
+                raise UserError('Đã có một phần Navigation/mux hoặc Mission bên ngoài Web. '
+                                'Dừng stack đó ở Terminal trước khi khởi động stack tích hợp.')
+            if name == 'navigation':
+                if self.recoverable_costmap_processes() or any(
+                        n in state.get('nodes', []) for n in ('/global_costmap/global_costmap', '/local_costmap/local_costmap')):
+                    raise UserError('Costmap riêng đang chạy. Dừng Costmap riêng trước; Navigation tự quản lý cả hai costmap.')
+                self._navigation_preflight(state)
+                package, launch = 'delivery_robot_nav2', 'navigation_integrated_mux.launch.py'
+            elif name == 'mission':
+                if not self._autonomy_status(state)['navigation']['running']:
+                    raise UserError('Khởi động Navigation trước khi mở Mission Manager.')
+                package, launch = 'delivery_robot_mission', 'mission_manager.launch.py'
+            else:
+                if self._autonomy_status(state)['navigation']['running']:
+                    raise UserError('Navigation đã quản lý command mux; chờ stack sẵn sàng, không mở mux thứ hai.')
+                package, launch = 'delivery_robot_cmd_mux', 'cmd_mux.launch.py'
+            ws = Path(self.store.config['ros_workspace']).expanduser().resolve()
+            setup = ws / 'install/setup.bash'
+            launch_file = ws / 'install' / package / 'share' / package / 'launch' / launch
+            if not setup.is_file() or not launch_file.is_file() or launch_file.stat().st_size == 0:
+                raise UserError('Chưa có launch đã build: ' + str(launch_file) + '. Build gói cập nhật rồi mở lại Web.')
+            if cancel_event is not None and cancel_event.is_set():
+                raise UserError('Thao tác khởi động đã bị hủy; không mở tiến trình.')
+            if name == 'navigation':
+                self._handover_standalone_mux(cancel_event)
+            arguments = ' initial_mode:=STOP' if name == 'cmd_mux' else ''
+            command = ('set -e\nsource /opt/ros/jazzy/setup.bash\n'
+                       f'source {shlex.quote(str(setup))}\n'
+                       f'exec ros2 launch {package} {launch}{arguments}')
+            kwargs = {'cancel_event': cancel_event} if cancel_event is not None else {}
+            return self._spawn_shell(name, command, context={'package': package, 'startup': launch}, **kwargs)
+        except Exception as exc:
+            with self.lock:
+                self.failures[name] = str(exc)
+            raise
+        finally:
+            with self.lock:
+                self.operations.pop(name, None)
+
+    def _handover_standalone_mux(self, cancel_event=None):
+        if cancel_event is not None and cancel_event.is_set():
+            raise UserError('Thao tác khởi động đã bị hủy; giữ nguyên quyền sở hữu tiến trình.')
+        observed = self._autonomy_status()['cmd_mux']
+        if not observed['running']:
+            return
+        if not observed['managed']:
+            raise UserError('Command mux đang chạy ngoài Web. Dừng mux tại Terminal gốc trước khi bật Navigation tích hợp.')
+        navigation = getattr(self.ros, 'navigation', None)
+        if navigation is None:
+            raise UserError('Chưa có kết nối ROS để xác nhận STOP trước khi chuyển command mux.')
+        stopped = navigation.stop_all()
+        if not isinstance(stopped, dict) or not stopped.get('mux_confirmed') is True:
+            raise UserError('Chưa nhận xác nhận STOP từ command mux; chưa chuyển sang Navigation.')
+        if cancel_event is not None and cancel_event.is_set():
+            raise UserError('Thao tác khởi động đã bị hủy sau khi yêu cầu STOP.')
+        self.stop('cmd_mux', cascade=False, request_stop=False)
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                raise UserError('Thao tác khởi động đã bị hủy; không mở Navigation.')
+            state = self._state_for_process_checks()
+            if '/delivery_robot_cmd_mux' not in state.get('nodes', []) and not self._autonomy_processes('cmd_mux'):
+                return
+            time.sleep(0.15)
+        raise UserError('Mux riêng đã được dừng nhưng ROS vẫn còn endpoint cũ. Chờ discovery cập nhật rồi bật Navigation lại.')
 
     @staticmethod
     def udp_in_use(port):
@@ -38,6 +395,34 @@ class ProcessManager:
             sock.close()
 
     @staticmethod
+    def _process_identity(pid):
+        """Read only the identity and ROS paths needed to recover this project."""
+        directory = Path('/proc') / str(int(pid))
+        try:
+            if directory.stat().st_uid != os.getuid() or int(pid) == os.getpid():
+                return None
+            fields = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+            if fields[0] in ('Z', 'X'):
+                return None
+            argv = [arg.decode(errors='replace') for arg in
+                    (directory / 'cmdline').read_bytes().split(b'\0') if arg]
+            prefixes = []
+            try:
+                # Do not retain or expose arbitrary environment values.
+                for entry in (directory / 'environ').read_bytes().split(b'\0'):
+                    if entry.startswith(b'AMENT_PREFIX_PATH='):
+                        prefixes = entry.split(b'=', 1)[1].decode(errors='replace').split(':')
+                        break
+            except OSError:
+                pass
+            return {'pid': int(pid), 'argv': argv, 'cmdline': ' '.join(argv),
+                    'ppid': int(fields[1]), 'pgid': int(fields[2]), 'session': int(fields[3]),
+                    'start_ticks': int(fields[19]), 'cwd': str(directory.joinpath('cwd').resolve()),
+                    'ament_prefixes': prefixes}
+        except (OSError, ValueError, IndexError):
+            return None
+
+    @staticmethod
     def local_process_matches(needle):
         matches = []
         for p in Path('/proc').glob('[0-9]*'):
@@ -47,7 +432,9 @@ class ProcessManager:
                     continue
                 args = (p / 'cmdline').read_bytes().replace(b'\x00', b' ').decode(errors='replace').strip()
                 if needle in args:
-                    matches.append({'pid': pid, 'cmdline': args})
+                    identity = ProcessManager._process_identity(pid)
+                    if identity is not None:
+                        matches.append(identity)
             except (OSError, ValueError):
                 pass
         return matches
@@ -80,6 +467,95 @@ class ProcessManager:
                     continue
                 found[item['pid']] = item
         return list(found.values())
+
+    def _project_identity_matches(self, name, item):
+        """An explicit stop may recover this workspace, never a generic ROS name."""
+        c = self.store.config
+        workspace = Path(c['ros_workspace']).expanduser().resolve()
+        motor = Path(c['motor_project']).expanduser().resolve()
+        lidar = Path(c['lidar_script']).expanduser().resolve()
+        try:
+            args = item.get('argv') or shlex.split(item.get('cmdline', ''))
+        except ValueError:
+            return False
+        command = item.get('cmdline', '')
+        def in_path(value, root):
+            try:
+                return Path(value).is_absolute() and Path(value).resolve().is_relative_to(root)
+            except (OSError, ValueError):
+                return False
+        from_workspace = any(in_path(p, workspace) for p in item.get('ament_prefixes', []))
+        from_workspace |= any(in_path(arg, workspace) for arg in args)
+        def launch(package, filenames):
+            return from_workspace and any(
+                args[i:i+2] == ['launch', package] and i+2 < len(args) and args[i+2] in filenames
+                for i in range(len(args)))
+        def project_param(package):
+            return any(i+1 < len(args) and arg == '--params-file' and
+                       in_path(args[i+1], workspace) and package in Path(args[i+1]).parts
+                       for i, arg in enumerate(args))
+        if name == 'odom_bridge':
+            script = motor / 'host_ros2/odom_tf_joint_bridge.py'
+            exact = str(script) in args or (
+                item.get('cwd') == str(motor) and 'host_ros2/odom_tf_joint_bridge.py' in args)
+            return exact and all(value in args for value in (
+                'publish_tf:=false', 'left_joint:=wheel_joint_l', 'right_joint:=wheel_joint_r'))
+        if name == 'ekf_odom':
+            return launch('delivery_robot_localization_v14', {'official_odometry.launch.py'}) or (
+                any(arg.endswith('/robot_localization/ekf_node') for arg in args) and
+                project_param('delivery_robot_sensor_fusion_v14'))
+        if name == 'robot_model':
+            try:
+                urdf = Path(c['description_urdf']).expanduser().resolve().read_text().rstrip('\n')
+            except OSError:
+                return False
+            return bool(urdf) and any(arg.endswith('/robot_state_publisher/robot_state_publisher') for arg in args) and (
+                'robot_description:=' + urdf in args)
+        if name == 'lidar':
+            launch_path = lidar.parent / 'ld14p_wifi.launch.py'
+            return str(lidar) in args or str(launch_path) in args or (
+                item.get('cwd') == str(lidar.parent.parent) and
+                any(arg in ('./ubuntu/' + lidar.name, 'ubuntu/' + lidar.name) for arg in args))
+        if name == 'slam':
+            params = str((self.store.root / 'runtime/slam_web.yaml').resolve())
+            return params in args or ('slam_params_file:=' + params) in args
+        if name == 'rviz':
+            config = str((Path(__file__).parent / 'rviz/localization.rviz').resolve())
+            return config in args and any(Path(arg).name == 'rviz2' for arg in args)
+        if name == 'localization':
+            return launch('delivery_robot_localization_v14', {'amcl_localization.launch.py'}) or (
+                any(arg.endswith('/nav2_amcl/amcl') for arg in args) and
+                project_param('delivery_robot_localization_v14'))
+        if name == 'costmap':
+            return launch('delivery_robot_nav2', {'costmaps_only.launch.py'}) or (
+                any(arg.endswith('/nav2_costmap_2d/nav2_costmap_2d') for arg in args) and
+                project_param('delivery_robot_nav2'))
+        if name == 'navigation':
+            launches = {'navigation_integrated_mux.launch.py', 'navigation_mux.launch.py',
+                'navigation_safe.launch.py', 'navigation_real_direct.launch.py',
+                'controller_safe.launch.py', 'controller_real_direct.launch.py', 'planner_only.launch.py'}
+            return launch('delivery_robot_nav2', launches) or (
+                any('/nav2_' in arg and '/lib/' in arg for arg in args) and
+                project_param('delivery_robot_nav2'))
+        if name in ('mission', 'cmd_mux'):
+            package = 'delivery_robot_mission' if name == 'mission' else 'delivery_robot_cmd_mux'
+            executable = 'mission_manager' if name == 'mission' else 'cmd_mux'
+            filename = executable + '.launch.py'
+            return launch(package, {filename}) or any(
+                in_path(arg, workspace) and Path(arg).name == executable and package in Path(arg).parts
+                for arg in args)
+        return False
+
+    def recoverable_project_processes(self, name):
+        if name in ('navigation', 'mission', 'cmd_mux'):
+            candidates = self._autonomy_processes(name)
+        elif name == 'localization':
+            candidates = self.recoverable_localization_processes()
+        elif name == 'costmap':
+            candidates = self.recoverable_costmap_processes()
+        else:
+            candidates = self.recoverable_base_processes(name)
+        return [item for item in candidates if self._project_identity_matches(name, item)]
 
     @classmethod
     def recoverable_costmap_processes(cls):
@@ -168,49 +644,13 @@ class ProcessManager:
         return list(found.values())
 
     def cleanup_stale_project_stack(self):
-        """Make Web startup observationally OFF without starting anything.
+        """Compatibility hook: Web startup only observes external processes.
 
-        A previous Web process may have been killed before its finally block ran,
-        leaving ROS children re-parented to systemd --user.  Only exact project
-        processes are cleaned here.  Unknown/manual processes are left alone and
-        will be reported as external conflicts by the preflight step.
+        A package/command match is not proof that this Web instance owns a PID.
+        No process is stopped on startup. Explicit Stop can recover same-user
+        configured-project processes after revalidating PID and start time.
         """
-        cleaned = []
-        # Stop dependants first, then the verified base stack in reverse order.
-        for name, label, getter in (
-            ('rviz', 'RViz2 của Web cũ', lambda: self.recoverable_base_processes('rviz')),
-            ('costmap', 'Nav2 Costmap cũ', self.recoverable_costmap_processes),
-            ('localization', 'AMCL/Map Server cũ', self.recoverable_localization_processes),
-            ('slam', 'SLAM cũ', lambda: self.recoverable_base_processes('slam')),
-            ('lidar', 'LiDAR cũ', lambda: self.recoverable_base_processes('lidar')),
-            ('robot_model', 'Robot Model cũ', lambda: self.recoverable_base_processes('robot_model')),
-            ('ekf_odom', 'EKF V14 cũ', lambda: self.recoverable_base_processes('ekf_odom')),
-            ('odom_bridge', 'Odom Bridge cũ', lambda: self.recoverable_base_processes('odom_bridge')),
-        ):
-            matches = getter()
-            if not matches:
-                continue
-            try:
-                self._stop_exact_processes(matches, label)
-                cleaned.append(name)
-                self.store.audit('startup_cleanup', name)
-            except Exception as exc:
-                self.store.audit('startup_cleanup_failed', f'{name}: {exc}')
-
-        # The Docker Agent has its own narrow helper. If it was left running by a
-        # previous Web session, stop it so opening the Web never means "system ON".
-        try:
-            info = self.agent.snapshot(fresh=True)
-            if info.get('running'):
-                self.agent.stop()
-                cleaned.append('agent')
-                self.store.audit('startup_cleanup', 'agent')
-        except Exception as exc:
-            self.store.audit('startup_cleanup_failed', f'agent: {exc}')
-        self.agent_started = False
-        if any(name in cleaned for name in ('lidar', 'robot_model', 'ekf_odom', 'odom_bridge')):
-            self._wait_base_graph_clear(timeout=5.0)
-        return cleaned
+        return []
 
     def _wait_base_graph_clear(self, timeout=5.0):
         """Wait for DDS graph to forget exact base-stack nodes after cleanup.
@@ -235,54 +675,26 @@ class ProcessManager:
             time.sleep(0.25)
         return False
 
-    def prepare_base_stack_for_connect(self):
-        """Stop only stale, exact project processes before a fresh Connect.
-
-        Nothing is started here.  The button press remains the only action that
-        starts Agent -> Odom -> EKF -> Robot Model -> LiDAR.  This also handles
-        an EKF child re-parented to systemd --user after an older Web session.
-        """
+    def prepare_base_stack_for_connect(self, reuse_owned=False):
+        """Validate ownership without killing a running robot from another session."""
         if self.offline:
             raise UserError('OFFLINE: không khởi động phần cứng/ROS từ giao diện thử.')
-
-        # If this Web instance already owns a base component, do not tear it
-        # down behind the operator's back.  Treat repeated Connect as a no-op
-        # conflict instead of mixing two sessions.
+        if not (reuse_owned and self._owned_live('navigation')):
+            self._require_navigation_stopped('kết nối lại hệ thống nền')
         with self.lock:
-            owned = [name for name in ('odom_bridge','ekf_odom','robot_model','lidar')
+            owned = [name for name in ('cmd_mux', 'odom_bridge', 'ekf_odom', 'robot_model', 'lidar')
                      if name in self.children and self.children[name]['process'].poll() is None]
-        if owned:
-            raise UserError('Hệ thống đã được phiên Web này khởi động: ' + ', '.join(owned) + '. Dùng Dừng hệ thống trước khi Kết nối lại.')
+        if owned and not reuse_owned:
+            raise UserError('Hệ thống đã được phiên Web này khởi động: ' + ', '.join(owned) +
+                            '. Dùng Dừng hệ thống trước khi Kết nối lại.')
+        external = [name for name in ('odom_bridge', 'ekf_odom', 'robot_model', 'lidar')
+                    if not (reuse_owned and self._owned_live(name)) and self.recoverable_base_processes(name)]
+        if external:
+            raise UserError('Thành phần đang chạy ngoài phiên Web: ' + ', '.join(external) +
+                            '. Bấm Dừng hệ thống để đóng đúng tiến trình dự án trước khi kết nối lại.')
+        return []
 
-        cleaned = []
-        for name, label in (
-            ('lidar', 'LiDAR cũ'),
-            ('robot_model', 'Robot Model cũ'),
-            ('ekf_odom', 'EKF V14 cũ'),
-            ('odom_bridge', 'Odom Bridge cũ'),
-        ):
-            matches = self.recoverable_base_processes(name)
-            if matches:
-                self._stop_exact_processes(matches, label)
-                cleaned.append(name)
-                self.store.audit('connect_cleanup', name)
-
-        # Stop the exact Web Agent helper if a previous Web session left it on.
-        try:
-            info = self.agent.snapshot(fresh=True)
-            if info.get('running'):
-                self.agent.stop()
-                self.agent_started = False
-                cleaned.append('agent')
-                self.store.audit('connect_cleanup', 'agent')
-        except Exception:
-            pass
-
-        if cleaned:
-            self._wait_base_graph_clear(timeout=5.0)
-        return cleaned
-
-    def preflight_base_stack(self):
+    def preflight_base_stack(self, reuse_owned=False):
         """Validate the whole base stack before starting the first component.
 
         This prevents the old partial-start failure mode where Agent/Odom/EKF were
@@ -290,17 +702,25 @@ class ProcessManager:
         """
         if self.offline:
             raise UserError('OFFLINE: không khởi động phần cứng/ROS từ giao diện thử.')
-        s, c = self.ros.status(), self.store.config
+        s, c = self._state_for_process_checks(), self.store.config
         nodes = s.get('nodes', [])
+        if reuse_owned:
+            for name, component_nodes in COMPONENT_NODES.items():
+                if self._owned_live(name):
+                    nodes = [node for node in nodes if node not in component_nodes]
+            if self._owned_live('lidar'):
+                s['scan_publishers'] = 0
 
-        # Exact stale project processes should have been cleaned on Web startup.
+        # Observe external processes; never assume a matching command is owned.
         stale = {}
         for name in ('odom_bridge', 'ekf_odom', 'robot_model', 'lidar'):
+            if reuse_owned and self._owned_live(name):
+                continue
             got = self.recoverable_base_processes(name)
             if got:
                 stale[name] = [x['pid'] for x in got]
         if stale:
-            raise UserError('Còn tiến trình cũ của dự án: ' + str(stale) + '. Dùng Dừng hệ thống hoặc restart Web để dọn sạch.')
+            raise UserError('Còn tiến trình cũ của dự án: ' + str(stale) + '. Dừng tại Terminal/phiên đã mở chúng trước khi Kết nối lại.')
 
         agent = self.agent.snapshot(fresh=True)
         if self.udp_in_use(c['agent_port']) and not agent.get('running'):
@@ -346,48 +766,94 @@ class ProcessManager:
         return alive
 
     def _stop_exact_processes(self, matches, label):
-        """Stop exact project processes without relying on a fixed PID.
+        """Explicit project recovery, pinned to uid/PID/start time.
 
-        Prefer their process groups so orphaned siblings (map_server, lifecycle
-        manager, costmap peer) stop together.  Escalate to SIGKILL only after
-        graceful SIGINT/SIGTERM have failed, and only for groups discovered from
-        the exact project matches above.
+        Never signal an arbitrary terminal process group. Isolated ROS launch
+        sessions can include verified companion nodes (map server/lifecycle).
+        Each PID is revalidated before every signal, including escalation.
         """
-        pids = sorted({int(m['pid']) for m in matches})
-        if not pids:
-            raise UserError(f'Không tìm thấy tiến trình {label} đúng của dự án để dừng.')
-        own_pgid = os.getpgrp()
-        pgids = set()
-        for pid in pids:
-            try:
-                pgid = os.getpgid(pid)
-                if pgid > 1 and pgid != own_pgid:
-                    pgids.add(pgid)
-            except ProcessLookupError:
-                pass
+        records = {}
+        groups = set()
+        for match in matches:
+            current = self._process_identity(match['pid'])
+            if current is None:
+                continue
+            if ('start_ticks' in match and match['start_ticks'] != current['start_ticks']) or not self._project_identity_matches(label, current):
+                raise UserError('Tiến trình đã đổi danh tính; chưa gửi tín hiệu: ' + str(match['pid']))
+            records[current['pid']] = current
+            if current['pgid'] == current['session'] and current['pgid'] != os.getpgrp():
+                groups.add(current['pgid'])
+        if not records:
+            return
+        allowed = {
+            'navigation': {'controller_server', 'planner_server', 'behavior_server', 'bt_navigator',
+                'waypoint_follower', 'velocity_smoother', 'collision_monitor', 'lifecycle_manager', 'cmd_mux'},
+            'mission': {'mission_manager'}, 'cmd_mux': {'cmd_mux'},
+            'localization': {'amcl', 'map_server', 'lifecycle_manager'},
+            'costmap': {'nav2_costmap_2d', 'lifecycle_manager'},
+            'ekf_odom': {'ekf_node', 'static_transform_publisher'},
+            'robot_model': {'robot_state_publisher'}, 'odom_bridge': {'odom_tf_joint_bridge.py'},
+            'slam': {'async_slam_toolbox_node', 'lifecycle_manager'},
+            'lidar': {'start_ld14p_wifi.sh', 'ld14p_wifi.launch.py', 'ldlidar_publisher_ld14', 'socat'},
+            'rviz': {'rviz2'},
+        }.get(label, set())
+        # Capture isolated session siblings only if their executable is a
+        # component of this exact ROS launch. Do not kill an unrelated process
+        # merely because it shares a login/session.
+        group_members = {group: [] for group in groups}
+        for directory in Path('/proc').glob('[0-9]*'):
+            record = self._process_identity(directory.name)
+            if record is None or record['pgid'] not in groups or record['session'] != record['pgid']:
+                continue
+            group_members[record['pgid']].append(record)
+        for group, members in group_members.items():
+            permitted = all(record['pid'] in records or self._project_identity_matches(label, record) or
+                            (record['argv'] and Path(record['argv'][0]).name in allowed)
+                            for record in members)
+            if permitted:
+                records.update((record['pid'], record) for record in members)
+            else:
+                groups.discard(group)
 
+        # For normal terminal launches, include only observed descendants of an
+        # exact matched parent; never the terminal shell or its other jobs.
+        descendants = {}
+        for directory in Path('/proc').glob('[0-9]*'):
+            record = self._process_identity(directory.name)
+            if record is not None:
+                descendants[record['pid']] = record
+        changed = True
+        while changed:
+            changed = False
+            for pid, record in descendants.items():
+                if pid not in records and record['ppid'] in records:
+                    records[pid] = record
+                    changed = True
+
+        def remaining():
+            alive = []
+            for record in records.values():
+                now = self._process_identity(record['pid'])
+                if now is not None and now['start_ticks'] == record['start_ticks']:
+                    alive.append(record)
+            return alive
+
+        if not records:
+            raise UserError(f'Không tìm thấy tiến trình {label} đúng của dự án để dừng.')
         for sig, seconds in ((signal.SIGINT, 4.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, 1.0)):
-            for pgid in list(pgids):
+            for record in remaining():
                 try:
-                    os.killpg(pgid, sig)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    pass
-            # Also signal exact PIDs in case an orphan changed process group.
-            for pid in self._pids_alive(pids):
-                try:
-                    os.kill(pid, sig)
+                    os.kill(record['pid'], sig)
                 except ProcessLookupError:
                     pass
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
-                if not self._pids_alive(pids):
+                if not remaining():
                     return
                 time.sleep(0.1)
-        remaining = self._pids_alive(pids)
-        if remaining:
-            raise UserError(f'{label} vẫn chưa dừng sau SIGKILL: PID {remaining}')
+        alive = [record['pid'] for record in remaining()]
+        if alive:
+            raise UserError(f'{label} vẫn chưa dừng: PID {alive}')
 
     def _ros_cli(self, command, timeout=6):
         c = self.store.config
@@ -403,7 +869,7 @@ class ProcessManager:
             text=True, timeout=timeout, check=False,
         )
 
-    def _ensure_costmaps_active(self):
+    def _ensure_costmaps_active(self, cancel_event=None):
         nodes = ('/global_costmap/global_costmap', '/local_costmap/local_costmap')
         deadline = time.monotonic() + 18.0
         last = {}
@@ -413,6 +879,8 @@ class ProcessManager:
         # transition, avoiding configure/activate races.
         grace = time.monotonic() + 7.0
         while time.monotonic() < grace:
+            if self.closing or (cancel_event is not None and cancel_event.is_set()):
+                raise UserError('Đã hủy khởi động Costmap.')
             active = []
             for node in nodes:
                 get = self._ros_cli(f'ros2 lifecycle get {shlex.quote(node)}', timeout=3)
@@ -424,6 +892,8 @@ class ProcessManager:
             time.sleep(0.4)
 
         while time.monotonic() < deadline:
+            if self.closing or (cancel_event is not None and cancel_event.is_set()):
+                raise UserError('Đã hủy khởi động Costmap.')
             all_active = True
             for node in nodes:
                 get = self._ros_cli(f'ros2 lifecycle get {shlex.quote(node)}', timeout=3)
@@ -455,30 +925,37 @@ class ProcessManager:
 
     def status(self):
         with self.lock:
-            result = {
-                name: {
-                    'running': item['process'].poll() is None,
-                    'pid': item['process'].pid,
-                    'returncode': item['process'].poll(),
-                    'log': str(item['log']), 'managed': True, 'external': False,
-                    'message': ('Tiến trình đang chạy; kiểm tra dữ liệu ROS.'
-                                if item['process'].poll() is None
-                                else 'Tiến trình đã thoát. Bấm Xem log để đọc lỗi.'),
+            result = {}
+            for name, item in self.children.items():
+                code = item['process'].poll()
+                orphaned = code is not None and self._owned_group_running(item['process'].pid)
+                running = code is None or orphaned
+                status = self.operations.get(name) or ('failed' if orphaned or name in self.failures
+                          else 'starting' if running else 'stopped')
+                result[name] = {
+                    'running': running, 'pid': item['process'].pid, 'returncode': code,
+                    'log': str(item.get('log', '')), 'managed': running, 'external': False,
+                    'orphaned': orphaned, 'status': status, 'ready': False,
+                    'message': ('Launch đã thoát; còn tiến trình con cần dừng.' if orphaned else
+                                self.failures.get(name) or ('Đang chạy.' if running else 'Đã dừng.')),
                     'context': item.get('context', {}),
                 }
-                for name, item in self.children.items()
-            }
         if self.offline:
+            result.update(self._autonomy_status({'nodes': []}))
             return result
 
-        state = self.ros.status()
+        state = self._state_for_process_checks()
         service = self.agent.snapshot()
         busy = self.udp_in_use(self.store.config['agent_port'])
-        external_agent = busy and not service['running']
+        external_agent = bool((busy or service['running']) and not self.agent_started)
         result['agent'] = {
             **service,
-            'managed': service['installed'],
+            'running': bool(service.get('running') or busy),
+            'managed': self.agent_started and service.get('running', False),
             'external': external_agent,
+            'recoverable': bool(service.get('installed') and service.get('running')),
+            'status': self.operations.get('agent') or ('unknown' if service.get('installed') and not service.get('status_known', True)
+                      else 'running' if service.get('running') else 'external' if busy else 'stopped'),
             'returncode': None,
             'ready': state.get('odom_publishers') == 1 and
                      state.get('odom', {}).get('receive_age') is not None and
@@ -501,21 +978,24 @@ class ProcessManager:
             ('rviz', '/rviz2'),
         ]:
             item = result.get(name)
-            if (not item or not item['running']) and node in nodes:
+            if not item or not item['running']:
                 if name == 'localization':
                     recoverable = self.recoverable_localization_processes()
                 elif name in ('odom_bridge', 'ekf_odom', 'robot_model', 'lidar', 'slam', 'rviz'):
                     recoverable = self.recoverable_base_processes(name)
                 else:
                     recoverable = []
-                can_recover = bool(recoverable)
+                if node not in nodes and not recoverable:
+                    continue
+                can_recover = bool(self.recoverable_project_processes(name))
                 result[name] = {
                     'running': True, 'external': True, 'managed': False,
                     'recoverable': can_recover,
+                    'status': 'external',
                     'pid': recoverable[0]['pid'] if recoverable else None,
                     'returncode': None,
                     'message': (
-                        'Tiến trình đúng của dự án còn từ phiên Web trước; Web có thể dừng an toàn rồi khởi động lại để có log mới.'
+                        'Tiến trình dự án đã được xác minh; có thể dừng từ Web.'
                         if can_recover else
                         'Đang chạy ngoài Web và không nhận diện là tiến trình cũ của dự án. Dừng ở Terminal gốc trước.'
                     ),
@@ -527,19 +1007,20 @@ class ProcessManager:
         # button remains available even before DDS node discovery catches up.
         global_costmap = '/global_costmap/global_costmap' in nodes
         local_costmap = '/local_costmap/local_costmap' in nodes
-        global_pub = state.get('global_costmap_publishers', 0) > 0
-        local_pub = state.get('local_costmap_publishers', 0) > 0
+        global_pub = (state.get('global_costmap_publishers') or 0) > 0
+        local_pub = (state.get('local_costmap_publishers') or 0) > 0
         cost_item = result.get('costmap')
         exact_costmap = self.recoverable_costmap_processes()
         if (not cost_item or not cost_item.get('running')) and (exact_costmap or global_costmap or local_costmap):
             result['costmap'] = {
                 'running': True, 'external': True, 'managed': False,
-                'recoverable': bool(exact_costmap),
+                'recoverable': bool(self.recoverable_project_processes('costmap')),
+                'status': 'external',
                 'pid': exact_costmap[0]['pid'] if exact_costmap else None,
                 'returncode': None,
                 'ready': global_pub and local_pub,
                 'message': (
-                    'Costmap đúng stack delivery_robot_nav2 đang chạy; Web có thể dừng an toàn.'
+                    'Costmap đang chạy ngoài phiên Web hiện tại; dừng tại Terminal/phiên đã mở.'
                     if exact_costmap else
                     'Có Costmap ngoài Web không nhận diện được. Dừng stack ngoài trước khi chuyển quyền cho Web.'
                 ),
@@ -567,73 +1048,151 @@ class ProcessManager:
                 wait = 'Odom Bridge no-TF chạy; đang chờ raw /odom từ ESP32 #1.'
             elif name == 'ekf_odom':
                 tf = state.get('tf_odom') or {}
-                ready = bool(tf) and -0.10 <= tf.get('age', 99) < 0.8
+                ready = self._fresh_age(tf.get('age'), minimum=-0.10, maximum=0.8)
                 wait = 'EKF V14 chạy; đang chờ TF odom→base_link filtered.'
             else:
                 ready = '/robot_state_publisher' in nodes
                 wait = 'Đang chờ node robot_state_publisher; xem log nếu chưa xuất hiện.'
-            item['ready'] = ready
-            item['message'] = 'Web quản lý · đã thấy dữ liệu/node tương ứng.' if ready else wait
+            item['ready'] = ready and not item.get('orphaned') and name not in self.failures
+            item['status'] = self.operations.get(name) or ('failed' if item.get('orphaned') or name in self.failures else 'ready' if item['ready'] else 'starting')
+            item['message'] = self.failures.get(name) or ('Web quản lý · đã thấy dữ liệu/node tương ứng.' if ready else wait)
+        autonomy = self._autonomy_status(state)
+        result.update(autonomy)
+        if autonomy['navigation']['running'] and result.get('costmap', {}).get('running'):
+            result['costmap'].update(managed=False, external=True, recoverable=False,
+                message='Costmap do Navigation quản lý; dùng thao tác Navigation để khởi động/dừng.')
+            result['costmap'].setdefault('context', {})['provided_by'] = 'navigation'
         return result
 
-    def stop_all(self):
-        """Operator-requested system stop: reverse the verified start order."""
+    def _request_motion_stop(self):
+        self.ros.motion.stop('Đang dừng hệ thống.', force=True)
+        gateway = getattr(self.ros, 'navigation', None)
+        if gateway is None:
+            return {'mux_confirmed': False, 'message': 'Chưa có kết nối command mux.'}
+        try:
+            result = gateway.stop_all()
+            return result if isinstance(result, dict) else {'mux_confirmed': False, 'message': 'Phản hồi STOP không hợp lệ.'}
+        except Exception as exc:
+            return {'mux_confirmed': False, 'message': str(exc)}
+
+    def _stop_plan(self, names, progress=None, *, recover=True, request_stop=True, strict_dependencies=False):
         results = []
-        status = self.status()
-        for name in ('rviz', 'costmap', 'localization', 'slam', 'lidar', 'robot_model', 'ekf_odom', 'odom_bridge', 'agent'):
-            item = status.get(name, {})
-            stoppable = (
-                item.get('running') and
-                ((item.get('managed') and not item.get('external')) or item.get('recoverable'))
-            )
-            if stoppable:
+        with self.stop_lock:
+            acknowledgement = self._request_motion_stop() if request_stop and names != ('rviz',) else None
+            for name in names:
+                self._emit_progress(progress, {'component': name, 'state': 'running', 'message': 'Đang dừng.'})
                 try:
-                    results.append({'component': name, 'ok': True, **self.stop(name)})
-                except UserError as exc:
-                    results.append({'component': name, 'ok': False, 'message': str(exc)})
+                    owned = self._owned_live(name)
+                    matches = self.recoverable_project_processes(name) if recover and not owned and name != 'agent' else []
+                    service = self.agent.snapshot(fresh=True) if name == 'agent' else {}
+                    helper_owned = (name == 'agent' and recover and service.get('installed') and
+                                    (service.get('running') or not service.get('status_known', True)))
+                    known_dead = name in self.children and not owned
+                    if owned or matches or helper_owned or known_dead:
+                        result = self._stop_one(name, matches=matches, recovered=not owned and bool(matches or helper_owned))
+                        row = {'component': name, 'ok': True, 'state': 'succeeded', **result}
+                    else:
+                        info = self.status().get(name, {})
+                        if info.get('running') or info.get('external'):
+                            row = {'component': name, 'ok': False, 'state': 'external', 'external': True,
+                                   'message': 'Còn tiến trình ngoài phạm vi dự án được xác minh; chưa dừng thành phần này.'}
+                        else:
+                            row = {'component': name, 'ok': True, 'state': 'succeeded', 'already_stopped': True,
+                                   'message': 'Đã dừng.'}
+                    if acknowledgement is not None and acknowledgement.get('mux_confirmed') is not True:
+                        row['warning'] = 'Chưa xác nhận STOP từ mux; việc đóng tiến trình vẫn được thực hiện.'
+                        row['stop_result'] = acknowledgement
+                except Exception as exc:
+                    row = {'component': name, 'ok': False, 'state': 'failed', 'message': str(exc)}
+                    try:
+                        self.store.audit('process_stop_failed', name + ': ' + str(exc))
+                    except Exception:
+                        pass
+                results.append(row)
+                self._emit_progress(progress, row)
+                if strict_dependencies and not row['ok']:
+                    break
         return results
 
-    def _spawn_shell(self, name: str, command: str, cwd: str | None = None, context: dict | None = None):
-        if name in self.children:
+    def stop_all(self, progress=None, *, recover=True, request_stop=True):
+        """Explicit operator stop: attempt every project component in reverse order.
+
+        Actual child identity drives shutdown, not ROS discovery. A dead executor,
+        a missing mux ACK or one failed child never skips the remaining cleanup.
+        Exact configured-project recovery is allowed only on this explicit action.
+        """
+        if self.offline:
+            raise UserError('OFFLINE: không dừng tiến trình thật.')
+        return self._stop_plan(STOP_ORDER, progress, recover=recover, request_stop=request_stop)
+
+    def _spawn_shell(self, name: str, command: str, cwd: str | None = None,
+                     context: dict | None = None, cancel_event=None):
+        # Popen + registration is atomic with close(): no delayed background
+        # startup can create a robot process after shutdown has enumerated owners.
+        with self.lock:
+            if self.closing:
+                raise UserError('Web đang đóng; không khởi động thêm tiến trình.')
+            if cancel_event is not None and cancel_event.is_set():
+                raise UserError('Thao tác khởi động đã bị hủy; không mở tiến trình.')
+            if getattr(self.ros, 'maintenance', False):
+                raise UserError('Đang cấu hình USB; không mở tiến trình robot.')
+            restart_required = name in self.confirmed_stops
+            if name in self.children:
+                if self.children[name]['process'].poll() is None:
+                    raise UserError('Tiến trình đã chạy; không mở bản trùng.')
+                try:
+                    self.children[name]['handle'].close()
+                except Exception:
+                    pass
+            log_path = self.store.root / 'logs' / f'{name}_{time.time_ns()}.log'
+            log = open(log_path, 'ab', buffering=0)
             try:
-                self.children[name]['handle'].close()
+                process = subprocess.Popen(
+                    ['/bin/bash', '-lc', command],
+                    cwd=cwd or str(Path.home()),
+                    stdout=log, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True, env=dict(os.environ),
+                )
             except Exception:
-                pass
-        log_path = self.store.root / 'logs' / f'{name}_{time.time_ns()}.log'
-        log = open(log_path, 'ab', buffering=0)
-        env = dict(os.environ)
-        try:
-            process = subprocess.Popen(
-                ['/bin/bash', '-lc', command],
-                cwd=cwd or str(Path.home()),
-                stdout=log, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True, env=env,
-            )
-        except Exception:
-            log.close()
-            raise
-        self.children[name] = {'process': process, 'log': log_path, 'handle': log, 'command': command, 'context': dict(context or {})}
+                log.close()
+                raise
+            self.children[name] = {'process': process, 'log': log_path, 'handle': log, 'command': command,
+                                   'context': dict(context or {}), 'started_at': time.monotonic()}
+            self.failures.pop(name, None)
+            self._discovery_cache.clear()
         time.sleep(0.8)
         if process.poll() is not None:
             log.close()
             error = log_path.read_text(errors='replace')[-2800:]
             raise UserError(f'{name} thoát với mã {process.returncode}. Log: ' + error)
+        self._new_owner_started(name, restart_required)
         self.store.audit('process_start', name)
-        return {'message': f'Đã khởi động {name} theo lệnh đã kiểm chứng; theo dõi dữ liệu thật ở Tổng quan.'}
+        return {'message': f'Đã mở tiến trình {name}; đang chờ xác nhận trạng thái ROS.'}
 
-    def start(self, name):
+    def start(self, name, cancel_event=None):
+        if self.closing:
+            raise UserError('Web đang đóng; không khởi động thêm tiến trình.')
+        if cancel_event is not None and cancel_event.is_set():
+            raise UserError('Thao tác khởi động đã bị hủy; không mở tiến trình.')
         if self.offline:
             raise UserError('OFFLINE: không khởi động phần cứng/ROS từ giao diện thử.')
-        if name not in ('agent', 'odom_bridge', 'ekf_odom', 'robot_model', 'lidar', 'slam', 'rviz', 'costmap'):
+        if name not in ('agent', 'odom_bridge', 'ekf_odom', 'robot_model', 'lidar', 'slam', 'rviz', 'costmap', 'navigation', 'mission', 'cmd_mux'):
             raise UserError('Thành phần không nằm trong danh sách được phép.')
         if getattr(self.ros, 'maintenance', False):
             raise UserError('Đang cấu hình USB; không thay đổi tiến trình robot.')
+        if name in ('navigation', 'mission', 'cmd_mux'):
+            return self._start_autonomy(name, cancel_event)
+        if name in ('slam', 'costmap'):
+            self._require_navigation_stopped('mở ' + name)
+        spawn_kwargs = {'cancel_event': cancel_event} if cancel_event is not None else {}
 
         with self.lock:
             if name in self.children and self.children[name]['process'].poll() is None:
                 return {'message': 'Đã chạy bởi ứng dụng; không mở bản trùng.'}
-            s, c = self.ros.status(), self.store.config
+            if name in self.children and self._owned_group_running(self.children[name]['process'].pid):
+                raise UserError('Còn tiến trình con của ' + name + '; dừng thành phần trước khi mở lại.')
+            s, c = self._state_for_process_checks(), self.store.config
 
             if name == 'agent':
                 before = self.agent.snapshot(fresh=True)
@@ -642,6 +1201,7 @@ class ProcessManager:
                 message = self.agent.start()
                 if not before['running']:
                     self.agent_started = True
+                    self._new_owner_started('agent', 'agent' in self.confirmed_stops)
                 self.store.audit('process_start', 'agent docker exact-command helper')
                 return {'message': message}
 
@@ -658,7 +1218,7 @@ class ProcessManager:
                     "exec /usr/bin/python3 host_ros2/odom_tf_joint_bridge.py "
                     "--ros-args -p left_joint:=wheel_joint_l -p right_joint:=wheel_joint_r -p publish_tf:=false"
                 )
-                return self._spawn_shell(name, command, str(project))
+                return self._spawn_shell(name, command, str(project), **spawn_kwargs)
 
             if name == 'ekf_odom':
                 if '/ekf_filter_node_v14' in s['nodes'] or self.local_process_contains('official_odometry.launch.py'):
@@ -672,7 +1232,7 @@ class ProcessManager:
                     f"source {shlex.quote(str(setup))}\n"
                     "exec ros2 launch delivery_robot_localization_v14 official_odometry.launch.py start_bridge:=false"
                 )
-                return self._spawn_shell(name, command)
+                return self._spawn_shell(name, command, **spawn_kwargs)
 
             if name == 'robot_model':
                 if '/robot_state_publisher' in s['nodes'] or self.local_process_contains('robot_state_publisher'):
@@ -692,7 +1252,7 @@ class ProcessManager:
                     "exec ros2 run robot_state_publisher robot_state_publisher --ros-args "
                     f"-p robot_description:=\"$(cat {shlex.quote(str(urdf))})\""
                 )
-                return self._spawn_shell(name, command)
+                return self._spawn_shell(name, command, **spawn_kwargs)
 
             if name == 'lidar':
                 if s.get('scan_publishers') or self.local_process_contains('start_ld14p_wifi.sh'):
@@ -705,7 +1265,7 @@ class ProcessManager:
                     f"cd {shlex.quote(str(project))}\n"
                     f"exec ./ubuntu/{shlex.quote(script.name)} {shlex.quote(str(c['lidar_ip']))} {int(c['lidar_port'])}"
                 )
-                return self._spawn_shell(name, command, str(project))
+                return self._spawn_shell(name, command, str(project), **spawn_kwargs)
 
             if name == 'costmap':
                 # WEB V5.2: use the exact Terminal workflow already verified on
@@ -717,17 +1277,14 @@ class ProcessManager:
                 any_nodes = ('/global_costmap/global_costmap' in s['nodes'] or
                              '/local_costmap/local_costmap' in s['nodes'])
                 if exact:
-                    states = self._ensure_costmaps_active()
-                    return {
-                        'message': 'Costmap đúng của dự án đã tồn tại; Web đã đảm bảo Global + Local ACTIVE.',
-                        'states': states,
-                    }
+                    return {'message': 'Costmap đã tồn tại ngoài Web; chỉ quan sát, không mở bản trùng hoặc đổi lifecycle.',
+                            'external': True, 'managed': False}
                 if any_nodes:
                     raise UserError('Có Costmap ngoài Web không nhận diện được. Dừng stack đó trước để tránh trùng node.')
                 if '/amcl' not in s['nodes']:
                     raise UserError('Bật AMCL trước khi bật Costmap Nav2.')
                 tf_map = s.get('tf_map') or {}
-                if not tf_map or not -0.15 <= tf_map.get('age', 99) < 1.0:
+                if not self._fresh_age(tf_map.get('age'), minimum=-0.15, maximum=1.0):
                     raise UserError('Chưa có TF map→odom/base_link mới. Hãy đặt Initial Pose trước.')
                 if s.get('scan_publishers') != 1:
                     raise UserError('Cần đúng một /scan publisher trước khi bật Costmap.')
@@ -746,13 +1303,14 @@ class ProcessManager:
                 )
                 result = self._spawn_shell(
                     'costmap', command,
-                    context={'stack': 'delivery_robot_nav2', 'startup': 'costmaps_only.launch.py'}
+                    context={'stack': 'delivery_robot_nav2', 'startup': 'costmaps_only.launch.py'},
+                    **spawn_kwargs
                 )
                 try:
                     # Give the launch-file lifecycle manager a chance to autostart
                     # first. If it leaves a node inactive, _ensure_costmaps_active
                     # applies configure/activate exactly as the proven Terminal fix.
-                    states = self._ensure_costmaps_active()
+                    states = self._ensure_costmaps_active(**({'cancel_event': cancel_event} if cancel_event is not None else {}))
                     with self.lock:
                         if 'costmap' in self.children:
                             self.children['costmap']['context']['lifecycle'] = states
@@ -776,12 +1334,12 @@ class ProcessManager:
                     f"source {shlex.quote(str(Path(c['ros_workspace']).expanduser().resolve() / 'install/setup.bash'))}\n"
                     f"exec rviz2 -d {shlex.quote(str(config))}"
                 )
-                return self._spawn_shell(name, command)
+                return self._spawn_shell(name, command, **spawn_kwargs)
 
             # SLAM is intentionally separate from the base system connect.
             if '/slam_toolbox' in s['nodes'] or self.local_process_contains('async_slam_toolbox_node'):
                 raise UserError('SLAM đang chạy bên ngoài ứng dụng. Dừng phiên hiện có trước.')
-            if '/amcl' in s['nodes'] or (s.get('tf_map') and -0.1 <= s['tf_map'].get('age', 99) < 1.0):
+            if '/amcl' in s['nodes'] or self._fresh_age((s.get('tf_map') or {}).get('age'), minimum=-0.1, maximum=1.0):
                 raise UserError('Đã có AMCL hoặc nguồn TF map. Dừng định vị trước khi tạo map mới.')
             if s['mapping_issues']:
                 raise UserError('Chưa bắt đầu SLAM: ' + ' '.join(s['mapping_issues']))
@@ -811,12 +1369,15 @@ class ProcessManager:
                 f"slam_params_file:={shlex.quote(str(target))}"
             )
             try:
-                return self._spawn_shell(name, command)
+                return self._spawn_shell(name, command, **spawn_kwargs)
             except Exception:
                 self.ros.end_map_session()
                 raise
 
-    def start_localization(self, map_yaml: Path, map_id: str, map_name: str):
+    def start_localization(self, map_yaml: Path, map_id: str, map_name: str, cancel_event=None):
+        if self.closing or (cancel_event is not None and cancel_event.is_set()):
+            raise UserError('Đã hủy khởi động định vị.')
+        self._require_navigation_stopped('thay đổi bản đồ định vị')
         if self.offline:
             raise UserError('OFFLINE: không khởi động AMCL thật.')
         if getattr(self.ros, 'maintenance', False):
@@ -828,13 +1389,13 @@ class ProcessManager:
             if 'localization' in self.children and self.children['localization']['process'].poll() is None:
                 current = self.children['localization'].get('context', {})
                 raise UserError('Localization đang chạy với map ' + str(current.get('map_name', 'đã chọn')) + '.')
-            s, c = self.ros.status(), self.store.config
+            s, c = self._state_for_process_checks(), self.store.config
             if '/slam_toolbox' in s.get('nodes', []) or self.local_process_contains('async_slam_toolbox_node'):
                 raise UserError('SLAM đang chạy. Dừng SLAM trước khi bật AMCL với map đã lưu.')
             if '/amcl' in s.get('nodes', []) or '/map_server' in s.get('nodes', []):
                 raise UserError('AMCL/Map Server đang chạy ngoài web. Dừng Terminal AMCL cũ trước khi chuyển quyền cho web.')
             tf = s.get('tf_odom') or {}
-            if not tf or not -0.15 <= tf.get('age', 99) < 1.0:
+            if not self._fresh_age(tf.get('age'), minimum=-0.15, maximum=1.0):
                 raise UserError('Chưa có TF odom→base_link mới từ EKF V14.')
             if s.get('scan_publishers') != 1 or s.get('scan', {}).get('receive_age') is None or s['scan']['receive_age'] > 1.0:
                 raise UserError('Cần đúng một /scan publisher và dữ liệu LiDAR mới trước khi bật AMCL.')
@@ -850,99 +1411,126 @@ class ProcessManager:
                 "exec ros2 launch delivery_robot_localization_v14 amcl_localization.launch.py "
                 f"map:={shlex.quote(str(path))}"
             )
-            result = self._spawn_shell('localization', command, context={'map_id': map_id, 'map_name': map_name, 'map_yaml': str(path)})
+            result = self._spawn_shell('localization', command,
+                context={'map_id': map_id, 'map_name': map_name, 'map_yaml': str(path)},
+                **({'cancel_event': cancel_event} if cancel_event is not None else {}))
             result['message'] = f'Đã mở Map Server + AMCL với map “{map_name}”. Hãy đặt Initial Pose nếu AMCL chưa có map→odom.'
             return result
 
-    def stop(self, name):
+    @staticmethod
+    def _owned_group_running(pgid):
+        """Detect surviving children of our session, excluding reaped/zombie tasks."""
+        for directory in Path('/proc').glob('[0-9]*'):
+            try:
+                if directory.stat().st_uid != os.getuid():
+                    continue
+                fields = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+                if int(fields[2]) == pgid and fields[0] not in ('Z', 'X'):
+                    return True
+            except (OSError, ValueError, IndexError):
+                pass
+        return False
+
+    def _stop_owned_child(self, process):
+        # All children are spawned with start_new_session=True. Retain their
+        # original process-group id even if the launch parent exits first.
+        pgid = process.pid
+        for sig, seconds in ((signal.SIGINT, 5.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, 1.0)):
+            if process.poll() is not None and not self._owned_group_running(pgid):
+                return
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                try:
+                    process.wait(timeout=min(0.1, max(0.001, deadline - time.monotonic())))
+                except subprocess.TimeoutExpired:
+                    pass
+                if process.poll() is not None and not self._owned_group_running(pgid):
+                    return
+                time.sleep(0.05)
+        raise UserError('Nhóm tiến trình do Web quản lý vẫn chưa dừng; xem log và trạng thái hệ thống.')
+
+    def _stop_one(self, name, *, matches=None, recovered=False):
+        """Stop one already selected owner; no graph-dependent shutdown gates."""
+        with self.lock:
+            if self.operations.get(name) == 'stopping':
+                raise UserError('Đang dừng ' + name + '.')
+            self.operations[name] = 'stopping'
+            item = self.children.get(name)
+        warning = None
+        try:
+            if name != 'rviz':
+                self.ros.motion.stop('Đang dừng ' + name + '.', force=True)
+            if name == 'agent':
+                message = self.agent.stop()
+                verified = self.agent.snapshot(fresh=True)
+                if verified.get('running') or not verified.get('status_known', True):
+                    raise UserError('Helper Agent chưa xác nhận container đã dừng.')
+                self.agent_started = False
+            elif matches:
+                self._stop_exact_processes(matches, name)
+                message = 'Đã dừng tiến trình dự án được xác minh.'
+            elif item is not None:
+                self._stop_owned_child(item['process'])
+                try:
+                    item['handle'].close()
+                except Exception:
+                    pass
+                message = 'Đã dừng.'
+            else:
+                raise UserError('Không tìm thấy tiến trình thuộc dự án để dừng.')
+            if name in ('navigation', 'mission', 'cmd_mux'):
+                gateway = getattr(self.ros, 'navigation', None)
+                retire = getattr(gateway, 'managed_shutdown_complete', None)
+                if retire is not None:
+                    try:
+                        retired = retire([name])
+                        record = getattr(self.store, 'interrupt_delivery', None)
+                        if record is not None and isinstance(retired, dict):
+                            record(retired.get('mission') or {})
+                    except Exception as exc:
+                        warning = 'Tiến trình đã dừng; chưa cập nhật được trạng thái: ' + str(exc)
+            if name == 'slam':
+                end = getattr(self.ros, 'end_map_session', None)
+                if end is not None:
+                    end()
+            try:
+                self._reset_after_stop(name)
+            except Exception as exc:
+                warning = 'Tiến trình đã dừng; chưa làm mới được dữ liệu: ' + str(exc)
+            self.store.audit('process_stop', name + (' recovered project' if recovered else ''))
+            result = {'message': message, 'managed': not recovered, 'recovered': recovered,
+                      'process_stopped': True}
+            if warning:
+                result['warning'] = warning
+            return result
+        except Exception as exc:
+            with self.lock:
+                self.failures[name] = str(exc)
+            raise
+        finally:
+            with self.lock:
+                self.operations.pop(name, None)
+
+    def stop(self, name, progress=None, *, cascade=True, request_stop=True):
         if self.offline:
             raise UserError('OFFLINE: không dừng dịch vụ thật.')
-        if name == 'agent':
-            if not self.agent.snapshot(fresh=True)['running']:
-                raise UserError('Agent helper không chạy; web không tắt Agent ngoài web.')
-            self.ros.motion.stop('Dừng trước khi ngắt Agent.', force=True)
-            time.sleep(0.2)
-            message = self.agent.stop()
-            self.agent_started = False
-            self.store.audit('process_stop', 'agent docker exact-command helper')
-            return {'message': message}
-
-        # Localization depends on a stable map TF; stop managed/recoverable
-        # costmaps first so no Nav2 layer is left dangling after AMCL stops.
-        if name == 'localization':
-            cst = self.status().get('costmap', {})
-            if cst.get('running'):
-                if not cst.get('external') or cst.get('recoverable'):
-                    self.stop('costmap')
-                else:
-                    raise UserError('Có Costmap ngoài Web không nhận diện được. Dừng Costmap đó trước khi dừng AMCL.')
-
-        with self.lock:
-            item = self.children.get(name)
-            if name == 'localization' and (item is None or item['process'].poll() is not None):
-                matches = self.recoverable_localization_processes()
-                if matches:
-                    self.ros.motion.stop('Dừng điều khiển trước khi thay đổi tiến trình.', force=True)
-                    time.sleep(0.2)
-                    self._stop_exact_processes(matches, 'Localization/AMCL')
-                    self.store.audit('process_stop', 'localization recovered exact project processes')
-                    return {'message': 'Đã dừng Map Server + AMCL đúng của dự án, kể cả process mồ côi; không cần PID thủ công.'}
-            if name == 'costmap' and (item is None or item['process'].poll() is not None):
-                matches = self.recoverable_costmap_processes()
-                if matches:
-                    self.ros.motion.stop('Dừng điều khiển trước khi thay đổi tiến trình.', force=True)
-                    time.sleep(0.2)
-                    self._stop_exact_processes(matches, 'Nav2 Costmap')
-                    self.store.audit('process_stop', 'costmap recovered exact project processes')
-                    return {'message': 'Đã dừng Global + Local Costmap đúng của delivery_robot_nav2.'}
-            if name in ('odom_bridge', 'ekf_odom', 'robot_model', 'lidar', 'slam', 'rviz') and (item is None or item['process'].poll() is not None):
-                matches = self.recoverable_base_processes(name)
-                if matches:
-                    self.ros.motion.stop('Dừng điều khiển trước khi thay đổi tiến trình.', force=True)
-                    time.sleep(0.2)
-                    self._stop_exact_processes(matches, name)
-                    self.store.audit('process_stop', f'{name} recovered exact project processes')
-                    return {'message': f'Đã dừng tiến trình {name} cũ đúng của dự án.'}
-            if item is None:
-                raise UserError('Web không sở hữu và không nhận diện được đúng tiến trình của dự án. Dùng Terminal gốc.')
-            self.ros.motion.stop('Dừng điều khiển trước khi thay đổi tiến trình.', force=True)
-            time.sleep(0.2)
-            process = item['process']
-            if process.poll() is None:
-                for sig, seconds in ((signal.SIGINT, 5), (signal.SIGTERM, 2), (signal.SIGKILL, 1)):
-                    try:
-                        os.killpg(process.pid, sig)
-                    except ProcessLookupError:
-                        break
-                    try:
-                        process.wait(timeout=seconds)
-                        break
-                    except subprocess.TimeoutExpired:
-                        continue
-                if process.poll() is None:
-                    raise UserError('Tiến trình do Web quản lý vẫn chưa dừng sau SIGKILL.')
-            # ros2 launch may exit before a child; clean only exact project orphans.
-            if name == 'localization':
-                leftovers = self.recoverable_localization_processes()
-                if leftovers:
-                    self._stop_exact_processes(leftovers, 'Localization/AMCL')
-            elif name == 'costmap':
-                leftovers = self.recoverable_costmap_processes()
-                if leftovers:
-                    self._stop_exact_processes(leftovers, 'Nav2 Costmap')
-            try:
-                item['handle'].close()
-            except Exception:
-                pass
-            if name == 'slam':
-                # Stop means end this mapping session and forget the live map.
-                # Saved map files in the library are untouched.
-                self.ros.end_map_session()
-            self.store.audit('process_stop', name)
-            return {'message': (
-                'Đã dừng SLAM và xóa bản đồ LIVE của phiên vừa kết thúc.'
-                if name == 'slam' else f'Đã dừng {name}. Các thành phần khác được giữ nguyên.'
-            )}
+        if name not in STOP_ORDER:
+            raise UserError('Thành phần không nằm trong danh sách được phép.')
+        dependencies = DEPENDENTS.get(name, ()) if cascade else ()
+        targets = tuple(component for component in STOP_ORDER if component in dependencies or component == name)
+        results = self._stop_plan(targets, progress, request_stop=request_stop,
+                                  strict_dependencies=True)
+        failed = next((row for row in results if not row.get('ok')), None)
+        if failed is not None:
+            label = ('Dừng Navigation trước. ' if failed['component'] == 'navigation' else '')
+            raise UserError(label + failed['component'] + ': ' + failed['message'])
+        return {'message': 'Đã dừng ' + name + '.', 'ok': True,
+                'managed': any(row.get('managed') for row in results), 'results': results,
+                'process_stopped': True}
 
     def log(self, name):
         if name == 'agent':
@@ -964,15 +1552,11 @@ class ProcessManager:
                 return f.read().decode(errors='replace')
 
     def close(self):
-        # Only processes started by this web instance are stopped on server shutdown.
-        for name in ('rviz', 'costmap', 'localization', 'slam', 'lidar', 'robot_model', 'ekf_odom', 'odom_bridge'):
-            if name in self.children:
-                try:
-                    self.stop(name)
-                except Exception:
-                    pass
-        if self.agent_started:
-            try:
-                self.stop('agent')
-            except Exception:
-                pass
+        """Shutdown only this session's owners; explicit UI Stop can recover older sessions."""
+        with self.lock:
+            self.closing = True
+        try:
+            return self.stop_all(recover=False, request_stop=False)
+        except Exception as exc:
+            self.store.audit('shutdown_stop_failed', str(exc))
+            return [{'component': 'system', 'ok': False, 'state': 'failed', 'message': str(exc)}]

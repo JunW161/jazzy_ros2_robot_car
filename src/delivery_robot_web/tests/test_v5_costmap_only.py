@@ -69,21 +69,20 @@ def test_v52_costmap_start_uses_verified_launch_and_auto_active(tmp_path, monkey
     assert 'ACTIVE' in out['message']
 
 
-def test_v5_existing_exact_costmap_is_adopted_not_duplicated(tmp_path, monkeypatch):
+def test_existing_external_costmap_is_observed_without_lifecycle_mutation(tmp_path, monkeypatch):
     store = make_store(tmp_path)
     ros, _ = healthy_ros(store)
     pm = ProcessManager(store, ros, offline=False)
     monkeypatch.setattr(pm, 'recoverable_costmap_processes', lambda: [
         {'pid': 4567, 'cmdline': '/opt/ros/jazzy/lib/nav2_costmap_2d/nav2_costmap_2d --params-file /home/tuan/ros2_ws/install/delivery_robot_nav2/share/delivery_robot_nav2/config/costmaps_v1.yaml'}
     ])
-    monkeypatch.setattr(pm, '_ensure_costmaps_active', lambda: {
-        '/global_costmap/global_costmap': 'active [3]',
-        '/local_costmap/local_costmap': 'active [3]',
-    })
+    monkeypatch.setattr(pm, '_ensure_costmaps_active', lambda: (_ for _ in ()).throw(
+        AssertionError('Must not change lifecycle of externally owned costmaps')))
     monkeypatch.setattr(pm, '_spawn_shell', lambda *a, **k: (_ for _ in ()).throw(AssertionError('must not spawn duplicate')))
     out = pm.start('costmap')
     assert 'đã tồn tại' in out['message']
-    assert 'ACTIVE' in out['message']
+    assert out['external'] is True
+    assert out['managed'] is False
 
 
 def test_v5_external_exact_costmap_visible_even_before_node_discovery(tmp_path, monkeypatch):
@@ -99,7 +98,7 @@ def test_v5_external_exact_costmap_visible_even_before_node_discovery(tmp_path, 
     st = pm.status()['costmap']
     assert st['running'] is True
     assert st['external'] is True
-    assert st['recoverable'] is True
+    assert st['recoverable'] is True  # Explicit stop restores the verified V5 recovery workflow.
     assert st['pid'] == 7777
 
 

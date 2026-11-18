@@ -72,26 +72,44 @@ def main():
     from .app import create_app
     import uvicorn
     manager = ProcessManager(store, ros, offline=args.offline)
-    if not args.offline:
-        # Clean only exact stale processes from a previous Web/project session.
-        # Opening the Web must never mean that Odom/EKF/Model/LiDAR are already ON.
-        cleaned = manager.cleanup_stale_project_stack()
-        if cleaned:
-            import time
-            print('Đã dọn tiến trình cũ của dự án trước khi mở Web: ' + ', '.join(cleaned))
-            time.sleep(0.8)
+    # Opening the operator console only observes existing ROS processes.
+    # Command-line launches remain owned by their originating session.
     app = create_app(store, ros, motion, manager, port=args.port)
     print(f'Robot Delivery: http://127.0.0.1:{args.port}')
     print('Chỉ quan sát lúc khởi động. Chưa phát lệnh motor. Ctrl+C để dừng server và các tiến trình do web quản lý.')
     try:
         uvicorn.run(app, host='127.0.0.1', port=args.port, access_log=False, workers=1)
     finally:
-        motion.stop('Server đang đóng.')
+        with manager.lock:
+            manager.closing = True
+        system = getattr(app.state, 'system', None)
+        if system is not None:
+            try:
+                system.close()
+            except Exception as exc:
+                print('Lỗi khi kết thúc thao tác hệ thống: ' + str(exc))
+        delivery = getattr(app.state, 'delivery', None)
+        if delivery is not None:
+            try:
+                delivery.close()
+            except Exception as exc:
+                print('Lỗi khi kết thúc tác vụ Web: ' + str(exc))
+        motion.stop('Server đang đóng.', force=True)
+        gateway = getattr(ros, 'navigation', None)
+        if gateway is not None and not args.offline:
+            try:
+                result = gateway.stop_all()
+                if not isinstance(result, dict) or result.get('mux_confirmed') is not True:
+                    print('Đang đóng Web: chưa có xác nhận STOP từ command mux.')
+            except Exception as exc:
+                print('Đang đóng Web: không xác nhận được dừng qua ROS: ' + str(exc))
         import time
         time.sleep(0.2)
-        app.state.usb.close()
-        manager.close()
-        ros.close()
+        for label, close in (('USB', app.state.usb.close), ('tiến trình', manager.close), ('ROS', ros.close)):
+            try:
+                close()
+            except Exception as exc:
+                print('Lỗi khi đóng ' + label + ': ' + str(exc))
         lock.close()
 
 

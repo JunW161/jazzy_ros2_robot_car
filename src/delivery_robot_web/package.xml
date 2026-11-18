@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>delivery_robot_web</name><version>5.2.0</version>
+  <name>delivery_robot_web</name><version>6.1.0</version>
   <description>Local operator web for the two-ESP32 delivery robot.</description>
   <maintainer email="robot@example.invalid">Robot workspace operator</maintainer>
   <license>MIT</license>
@@ -8,6 +8,10 @@
   <exec_depend>rclpy</exec_depend><exec_depend>std_msgs</exec_depend><exec_depend>robot_state_publisher</exec_depend><exec_depend>launch_ros</exec_depend><exec_depend>python3-fastapi</exec_depend><exec_depend>python3-uvicorn</exec_depend><exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend><exec_depend>nav_msgs</exec_depend>
   <exec_depend>tf2_ros_py</exec_depend><exec_depend>lifecycle_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend><exec_depend>action_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend><exec_depend>std_srvs</exec_depend>
+  <exec_depend>delivery_robot_interfaces</exec_depend>
+  <exec_depend>delivery_robot_mission</exec_depend><exec_depend>delivery_robot_cmd_mux</exec_depend>
   <exec_depend>ament_index_python</exec_depend><exec_depend>slam_toolbox</exec_depend>
   <exec_depend>rviz2</exec_depend><exec_depend>delivery_robot_localization_v14</exec_depend>
   <exec_depend>delivery_robot_nav2</exec_depend><exec_depend>nav2_costmap_2d</exec_depend><exec_depend>nav2_lifecycle_manager</exec_depend>

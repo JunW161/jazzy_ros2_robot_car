@@ -100,7 +100,7 @@ def test_offline_localization_and_rviz_are_never_started(tmp_path):
         pm.start('rviz')
 
 
-def test_exact_external_localization_is_recoverable_and_can_be_stopped(tmp_path, monkeypatch):
+def test_exact_external_localization_stays_outside_web_ownership(tmp_path, monkeypatch):
     store = make_store(tmp_path)
     ros, state = healthy_ros(store)
     state['nodes'] = ['/amcl']
@@ -112,10 +112,11 @@ def test_exact_external_localization_is_recoverable_and_can_be_stopped(tmp_path,
     ])
     st = pm.status()['localization']
     assert st['external'] is True
-    assert st['recoverable'] is True
+    assert st['recoverable'] is False
     assert st['pid'] == 4321
 
-    monkeypatch.setattr('delivery_robot_web.processes.time.sleep', lambda *_: None)
-    monkeypatch.setattr('delivery_robot_web.processes.os.kill', lambda *_: (_ for _ in ()).throw(ProcessLookupError()))
-    out = pm.stop('localization')
-    assert 'Đã dừng Map Server + AMCL' in out['message']
+    def forbidden_signal(*args):
+        raise AssertionError('An external process must never be signaled')
+    monkeypatch.setattr('delivery_robot_web.processes.os.killpg', forbidden_signal)
+    with pytest.raises(UserError, match='ngoài phạm vi'):
+        pm.stop('localization')

@@ -3,9 +3,10 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 from delivery_robot_web.core import Store, MotionLease
-from delivery_robot_web.processes import ProcessManager
+from delivery_robot_web.processes import ProcessManager, STOP_ORDER
 from delivery_robot_web import cli
 from delivery_robot_web.app import create_app
+from delivery_robot_web.system_control import SystemCoordinator, BASE_ORDER
 
 
 def make_pm(tmp_path):
@@ -28,24 +29,29 @@ def make_pm(tmp_path):
 
 def test_web_serve_does_not_start_robot_components_automatically():
     src = inspect.getsource(cli.main)
-    # Startup is allowed to STOP stale exact project processes, but never start them.
-    assert 'cleanup_stale_project_stack()' in src
-    assert 'manager.start(' not in src
-    assert src.index('cleanup_stale_project_stack()') < src.index('create_app(')
+    startup = src[:src.index('uvicorn.run(')]
+    assert 'cleanup_stale_project_stack()' not in startup
+    assert 'manager.start(' not in startup
 
 
 def test_connect_preflights_whole_stack_and_rolls_back_partial_start():
-    src = inspect.getsource(create_app)
-    block = src[src.index("@app.post('/api/system/connect')"):src.index("@app.post('/api/system/disconnect')")]
-    assert 'manager.preflight_base_stack()' in block
-    assert "order = ('agent','odom_bridge','ekf_odom','robot_model','lidar')" in block
-    assert 'for name in reversed(started)' in block
-    assert 'rolled_back' in block
+    # The HTTP handler now reserves a background operation. Acquisition and
+    # rollback live together in the coordinator; behavior is covered in v6.1.
+    block = inspect.getsource(SystemCoordinator._run)
+    assert 'manager.preflight_base_stack(reuse_owned=True)' in block
+    assert BASE_ORDER == ('agent', 'odom_bridge', 'ekf_odom', 'robot_model', 'lidar', 'cmd_mux')
+    assert 'self._rollback(acquired)' in block
 
 
-def test_normal_web_close_includes_costmap():
-    src = inspect.getsource(ProcessManager.close)
-    assert "('rviz', 'costmap', 'localization', 'slam', 'lidar', 'robot_model', 'ekf_odom', 'odom_bridge')" in src
+def test_normal_web_close_stops_owned_components_in_dependency_order(tmp_path, monkeypatch):
+    pm = make_pm(tmp_path)
+    names = ('mission', 'navigation', 'cmd_mux', 'costmap', 'localization', 'lidar')
+    for name in names:
+        pm.children[name] = {'process': NS(pid=990099, poll=lambda: None)}
+    stopped = []
+    monkeypatch.setattr(pm, '_stop_one', lambda name, **kw: stopped.append(name) or {'message': 'stopped'})
+    pm.close()
+    assert stopped == [name for name in STOP_ORDER if name in names]
 
 
 def test_recoverable_base_stack_is_strict(tmp_path, monkeypatch):
@@ -96,28 +102,38 @@ def test_startup_cleanup_never_starts_anything(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, '_stop_exact_processes', lambda matches, label: stopped.append((matches[0]['pid'], label)))
     monkeypatch.setattr(pm.agent, 'snapshot', lambda fresh=False: {'running': False})
     cleaned = pm.cleanup_stale_project_stack()
-    assert cleaned == ['lidar', 'robot_model', 'ekf_odom', 'odom_bridge']
-    assert [x[0] for x in stopped] == [4, 3, 2, 1]
+    assert cleaned == []
+    assert stopped == []
     assert pm.children == {}
 
 
 def test_recoverable_external_process_can_be_stopped_from_ui():
-    js = (Path(__file__).resolve().parents[1] / 'delivery_robot_web' / 'static' / 'app.js').read_text()
-    assert "stop.disabled=!own?.running||(external&&!own?.recoverable)" in js
+    # The shared harness checks recognized external versus unknown ownership,
+    # including a ROS fault and a dependent Navigation session.
+    import shutil
+    import subprocess
+    import pytest
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node.js is required for the production UI behavior harness')
+    subprocess.run([node, str(Path(__file__).with_name('ui_system.test.cjs'))],
+                   check=True, capture_output=True, text=True, timeout=20)
 
 
 def test_installer_refuses_mixed_old_backend_new_frontend():
     root = Path(__file__).resolve().parents[3]
-    text = (root / 'INSTALL_UBUNTU.sh').read_text()
-    assert 'Web delivery_robot_web đang chạy' in text
+    wrapper = (root / 'INSTALL_UBUNTU.sh').read_text()
+    assert 'tools/install_web_release.py' in wrapper
+    text = (root / 'tools/install_web_release.py').read_text()
+    assert 'require_stopped(process_scanner)' in text
     assert 'Ctrl+C terminal Web cũ' in text
 
 
 def test_connect_prepares_fresh_stack_before_preflight():
-    src = inspect.getsource(create_app)
-    block = src[src.index("@app.post('/api/system/connect')"):src.index("@app.post('/api/system/disconnect')")]
-    assert 'manager.prepare_base_stack_for_connect()' in block
-    assert block.index('manager.prepare_base_stack_for_connect()') < block.index('manager.preflight_base_stack()')
+    block = inspect.getsource(SystemCoordinator._run)
+    prepare = 'manager.prepare_base_stack_for_connect(reuse_owned=True)'
+    preflight = 'manager.preflight_base_stack(reuse_owned=True)'
+    assert block.index(prepare) < block.index(preflight)
 
 
 def test_ekf_recovery_accepts_orphan_child_by_node_name(tmp_path, monkeypatch):

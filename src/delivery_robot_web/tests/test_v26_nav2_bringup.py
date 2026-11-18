@@ -27,12 +27,19 @@ def healthy_ros(store):
 def test_v26_ui_has_costmap_controls():
     root = Path(__file__).resolve().parents[1] / 'delivery_robot_web' / 'static'
     html = (root / 'index.html').read_text()
-    js = (root / 'app.js').read_text()
     for token in ('id="startCostmap"', 'id="stopCostmap"',
                   'id="globalCostmapWebState"', 'id="localCostmapWebState"'):
         assert token in html
-    assert "/api/process/costmap/start" in js
-    assert "/api/process/costmap/stop" in js
+    # Execute the real generic routing and both Costmap button handlers.
+    # Their URLs are assembled dynamically; source substrings cannot verify them.
+    import shutil
+    import subprocess
+    import pytest
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node.js is required for the production UI behavior harness')
+    subprocess.run([node, str(Path(__file__).with_name('ui_system.test.cjs'))],
+                   check=True, capture_output=True, text=True, timeout=20)
 
 
 def test_orphan_project_amcl_is_recoverable_without_fixed_pid(monkeypatch):
@@ -95,7 +102,7 @@ def test_costmap_start_uses_verified_launch_and_web_verification(tmp_path, monke
     assert captured['context']['startup'] == 'costmaps_only.launch.py'
     assert 'ACTIVE' in out['message']
 
-def test_costmap_status_recovers_exact_project_children(tmp_path, monkeypatch):
+def test_costmap_status_observes_external_project_children(tmp_path, monkeypatch):
     store = make_store(tmp_path)
     ros, state = healthy_ros(store)
     state['nodes'] += ['/global_costmap/global_costmap', '/local_costmap/local_costmap']
@@ -110,5 +117,6 @@ def test_costmap_status_recovers_exact_project_children(tmp_path, monkeypatch):
     st = pm.status()['costmap']
     assert st['running'] is True
     assert st['external'] is True
-    assert st['recoverable'] is True
+    assert st['recoverable'] is True  # Explicit stop can recover this exact configured project.
+    assert st['managed'] is False
     assert st['ready'] is True

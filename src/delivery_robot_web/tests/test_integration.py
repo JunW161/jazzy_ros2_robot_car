@@ -29,6 +29,8 @@ CONFIG_PWM_UNCHANGED=240
 def network():return {'ssid':'Robot Wifi','password':'private-password-123','host':'192.168.1.144','port':8888,'motor_power_off':True}
 def healthy():
     return {'ros_ok':True,'odom_publishers':1,'cmd_subscribers':1,'other_cmd_publishers':[],
+            'motor_cmd_publishers':['/delivery_robot_cmd_mux'],
+            'motor_cmd_receivers':['/delivery_robot_motor'],
             'odom':{'stamp_age':.02,'receive_age':.02,'valid':True},
             'motor':{'safety_age':.05,'wheel_age':.05,'state':1,'rpm_l':0.,'interlock':1,'bench':False}}
 
@@ -176,7 +178,7 @@ def test_installer_only_adds_web_preserves_robot_source(tmp_path,project):
     release=Path(__file__).resolve().parents[3]
     tool=release/'tools/install_package.py'
     # Installed package tests need not have release tools.
-    if not tool.is_file():pytest.skip('release installer not present')
+    if not tool.is_file():pytest.skip('Legacy tools/install_package.py absent; Web 6 installer has separate tests/test_release_installer.py coverage.')
     spec=importlib.util.spec_from_file_location('installer',tool);mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
     home=tmp_path/'home';home.mkdir()
     ros=tmp_path/'ros2_ws';urdf=ros/'src/delivery_robot_description/urdf/delivery_car_robot.urdf';urdf.parent.mkdir(parents=True);urdf.write_text('<robot/>')
@@ -204,7 +206,7 @@ def test_installer_only_adds_web_preserves_robot_source(tmp_path,project):
 
 def test_service_request_waits_for_discovery_without_blocking_executor():
     from concurrent.futures import Future
-    r=RosAdapter.__new__(RosAdapter);r.jobs=queue.Queue()
+    r=RosAdapter.__new__(RosAdapter);r.jobs=queue.Queue();r.executor_available=lambda:True
     timers=[];ready=[False];destroyed=[]
     class Timer:
         def __init__(self,fn):self.fn=fn;self.cancelled=False
@@ -227,7 +229,7 @@ def test_service_request_waits_for_discovery_without_blocking_executor():
 
 
 def test_service_unavailable_timeout_reports_failure():
-    r=RosAdapter.__new__(RosAdapter);r.jobs=queue.Queue();timers=[];errors=[]
+    r=RosAdapter.__new__(RosAdapter);r.jobs=queue.Queue();r.executor_available=lambda:True;timers=[];errors=[]
     class Timer:
         def __init__(self,fn):self.fn=fn
         def cancel(self):pass

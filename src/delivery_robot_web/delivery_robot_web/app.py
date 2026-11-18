@@ -12,6 +12,8 @@ import threading
 import time
 import uuid
 import zipfile
+from contextlib import asynccontextmanager, suppress
+from functools import wraps
 from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -24,13 +26,42 @@ from . import serial_tools
 from .motion_profile import limits_info
 from .project import inspect_project
 from .usb_config import UsbConfigurator
+from .delivery import DeliveryCoordinator
+from .system_control import SystemCoordinator
 
 
 def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, port=8080):
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    delivery = DeliveryCoordinator(store, ros, motion, manager)
+    system = SystemCoordinator(store, ros, motion, manager, delivery)
+    delivery.system = system
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        async def observe_missions():
+            while True:
+                try:
+                    await asyncio.to_thread(delivery.snapshot)
+                except Exception:
+                    # Observing a disconnected ROS executor must not crash HTTP.
+                    # Requests/status still report the concrete unavailable state.
+                    pass
+                await asyncio.sleep(0.5)
+        observer = asyncio.create_task(observe_missions())
+        try:
+            yield
+        finally:
+            observer.cancel()
+            with suppress(asyncio.CancelledError):
+                await observer
+            await asyncio.to_thread(system.close)
+            await asyncio.to_thread(delivery.close)
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost'])
     app.state.store, app.state.ros, app.state.motion = store, ros, motion
     app.state.manager = manager
+    app.state.delivery = delivery
+    app.state.system = system
     usb = UsbConfigurator(store, ros, offline=manager.offline)
     app.state.usb = usb
     origins = {f'http://127.0.0.1:{port}', f'http://localhost:{port}'}
@@ -81,6 +112,21 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
             raise UserError('Đang build/nạp USB. Không điều khiển/thay đổi hệ thống.')
         if motion.status()['armed']:
             raise UserError('Dừng và khóa điều khiển trước khi thao tác này.')
+        if delivery.operation_snapshot()['state'] == 'running':
+            raise UserError('Đang khởi động/dừng Navigation; chờ thao tác hoàn tất.')
+        if system.busy():
+            raise UserError('Hệ thống đang xử lý một thao tác.')
+        delivery.ensure_idle()
+
+    def system_change(function):
+        @wraps(function)
+        def guarded(*args, **kwargs):
+            epoch = system.epoch()
+            with delivery.dispatch_lock, delivery.process_lock:
+                if epoch != system.epoch():
+                    raise UserError('Thao tác đã bị hủy bởi lệnh dừng.')
+                return function(*args, **kwargs)
+        return guarded
 
     def complete_status():
         s = ros.status()
@@ -88,7 +134,18 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
         s['processes'] = manager.status()
         s['usb_job'] = usb.status()
         s['limits'] = limits_info(store.config)
-        s['version'] = '5.2.0'
+        s['version'] = '6.1.0'
+        s['navigation'] = delivery.snapshot()
+        active_map = (s['processes'].get('localization', {}).get('context', {}).get('map_id')
+                      or delivery.verified_map_id())
+        s['navigation']['active_map_id'] = active_map
+        if active_map:
+            try:
+                s['navigation']['active_map_name'] = store.map(active_map)['name']
+            except UserError:
+                s['navigation']['active_map_name'] = None
+        s['navigation_operation'] = delivery.operation_snapshot()
+        s['system_operation'] = system.snapshot()
         return s
 
     @app.get('/')
@@ -153,6 +210,7 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
     def settings(): return store.config
 
     @app.post('/api/settings')
+    @system_change
     def settings_write(data: dict):
         ensure_stationary()
         if any(v['running'] for v in manager.status().values()):
@@ -166,47 +224,15 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
 
     @app.post('/api/system/connect')
     def connect_system():
-        ensure_stationary()
-        # Validate the entire base stack before starting the first component.
-        # This guarantees that a LiDAR conflict cannot leave Agent/Odom/EKF/Model
-        # half-started with no LiDAR log in the current Web session.
-        # Fresh Connect: stop only stale exact project processes left by
-        # previous Web sessions, then validate the graph before starting anything.
-        manager.prepare_base_stack_for_connect()
-        manager.preflight_base_stack()
-        results = []
-        started = []
-        order = ('agent','odom_bridge','ekf_odom','robot_model','lidar')
-        try:
-            for name in order:
-                out = manager.start(name)
-                started.append(name)
-                results.append({'component':name, 'ok':True, 'message':out['message']})
-                time.sleep(0.35)
-        except UserError as exc:
-            failed = order[len(started)] if len(started) < len(order) else 'unknown'
-            results.append({'component':failed, 'ok':False, 'message':str(exc)})
-            # Roll back only components started by this Connect request.
-            for name in reversed(started):
-                try:
-                    manager.stop(name)
-                except Exception:
-                    pass
-            return {
-                'results': results,
-                'rolled_back': True,
-                'note': 'Kết nối thất bại nên Web đã rollback các thành phần vừa mở; hệ thống không để ở trạng thái nửa chừng.'
-            }
-        return {
-            'results':results,
-            'rolled_back': False,
-            'note':'Thứ tự: Agent → Odom(no TF) → EKF V14 → Robot Model → LiDAR. Tất cả đều do phiên Web hiện tại quản lý và có log riêng.'
-        }
+        epoch = system.epoch()
+        with delivery.dispatch_lock, active_operations:
+            if usb.status().get('busy'):
+                raise UserError('Đang cấu hình thiết bị.')
+            return system.begin('connect', expected_epoch=epoch)
 
     @app.post('/api/system/disconnect')
     def disconnect_system():
-        motion.stop('Dừng các thành phần do web quản lý.', force=True)
-        return {'results': manager.stop_all()}
+        return system.begin('disconnect')
 
     @app.get('/api/usb/probe/{board}')
     def usb_probe(board: str): return usb.probe(board)
@@ -219,13 +245,13 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
 
     @app.post('/api/usb/build/{board}')
     def usb_build(board: str, data: dict):
-        with active_operations:
+        with delivery.dispatch_lock, active_operations:
             ensure_stationary()
             return usb.build(board,data)
 
     @app.post('/api/usb/flash')
     def usb_flash(data: dict):
-        with active_operations:
+        with delivery.dispatch_lock, active_operations:
             ensure_stationary()
             return usb.flash(data)
 
@@ -234,16 +260,24 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
 
     @app.post('/api/process/{name}/start')
     def process_start(name: str):
-        ensure_stationary()
-        return manager.start(name)
+        epoch = system.epoch()
+        with delivery.dispatch_lock:
+            ensure_stationary()
+            if name == 'navigation':
+                return delivery.begin('start', expected_epoch=epoch)
+            return system.begin('component_start', name, expected_epoch=epoch)
 
     @app.post('/api/process/{name}/stop')
-    def process_stop(name: str): return manager.stop(name)
+    def process_stop(name: str):
+        if name == 'navigation':
+            return delivery.begin('stop')
+        return system.begin('component_stop', name)
 
     @app.get('/api/process/{name}/log')
     def process_log(name: str): return {'text': manager.log(name)}
 
     @app.post('/api/slam/activate')
+    @system_change
     def activate():
         ensure_stationary()
         if 'slam' not in manager.status() or not manager.status()['slam']['running']:
@@ -255,14 +289,24 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
 
     @app.post('/api/control/arm')
     def arm(request: Request, data: dict):
+        intent = delivery.capture_intent()
         if data.get('watchdog_tested') is not True or data.get('clear_area') is not True:
             raise UserError('Phải xác nhận đã thử watchdog/dừng và khu vực an toàn.')
         if usb.status().get('busy'):
             raise UserError('Đang build/nạp USB; điều khiển khóa.')
         if ros.status().get('motor', {}).get('state') not in (None, 1):
             raise UserError('Chỉ nhận quyền khi firmware IDLE. Dừng robot trước.')
-        with active_operations:
-            key = motion.arm(owner(request), ros.motion_ready())
+        with delivery.dispatch_lock, active_operations:
+            delivery.check_intent(intent)
+            delivery.ensure_idle()
+            if system.busy():
+                raise UserError('Hệ thống đang xử lý một thao tác.')
+            if delivery.operation_snapshot()['state'] == 'running':
+                raise UserError('Chờ thao tác Navigation hoàn tất trước khi nhận quyền lái tay.')
+            if not ros.motion_ready():
+                raise UserError('Chưa đủ điều kiện lái tay: ' + '; '.join(ros.status().get('motion_issues', [])))
+            delivery.gateway.set_manual(**delivery.dispatch_arguments(intent))
+            key = delivery.finish_manual_arm(owner(request), intent)
         store.audit('motion_armed', request.state.session['username'])
         return {'key': key}
 
@@ -282,9 +326,55 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
 
     @app.post('/api/control/stop')
     def stop():
-        motion.stop('Người vận hành nhấn Dừng.', force=True)
-        store.audit('software_stop')
-        return {'ok': True, 'note': 'Dừng phần mềm, không thay thế dừng khẩn vật lý.'}
+        result = delivery.emergency_stop()
+        return {**result, 'note': 'Xác nhận STOP là phản hồi phần mềm từ mux; theo dõi encoder để biết bánh đã đứng yên.'}
+
+    @app.post('/api/navigation/start')
+    def navigation_start():
+        epoch = system.epoch()
+        with delivery.dispatch_lock:
+            ensure_stationary()
+            return delivery.begin('start', expected_epoch=epoch)
+
+    @app.post('/api/navigation/stop')
+    def navigation_stop():
+        return delivery.begin('stop')
+
+    @app.get('/api/navigation/map-match/{ident}')
+    def navigation_map_match(ident: str):
+        try:
+            record = delivery.validate_map(ident)
+            return {'matches': True, 'map_id': ident, 'message': 'Bản đồ khớp dữ liệu ROS.',
+                    'map_name': record['name']}
+        except (UserError, OSError) as exc:
+            return {'matches': False, 'map_id': ident, 'message': str(exc)}
+
+    @app.post('/api/navigation/goal')
+    def navigation_goal(data: dict):
+        if usb.status().get('busy'):
+            raise UserError('Đang cấu hình thiết bị, chưa gửi mục tiêu.')
+        return delivery.navigate_to(data)
+
+    @app.post('/api/navigation/cancel')
+    def navigation_cancel():
+        result = delivery.gateway.cancel_navigation()
+        store.audit('navigation_cancel', str(result.get('message', '')))
+        return result
+
+    @app.post('/api/missions/start')
+    def delivery_start(data: dict):
+        if usb.status().get('busy'):
+            raise UserError('Đang cấu hình thiết bị, chưa nhận nhiệm vụ.')
+        return delivery.start_delivery(data)
+
+    @app.get('/api/missions/history')
+    def delivery_history():
+        delivery.snapshot()
+        return {'items': store.delivery_history()}
+
+    @app.post('/api/missions/{action}')
+    def delivery_action(action: str):
+        return delivery.mission_action(action)
 
     @app.get('/api/map/live')
     def map_live():
@@ -341,6 +431,7 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
         return import_existing(store, str(data.get('key', '')), str(data.get('name', '')))
 
     @app.post('/api/maps/save')
+    @system_change
     def save_map(data: dict):
         with active_operations:
             ensure_stationary()
@@ -414,27 +505,27 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
             headers={'Content-Disposition': f'attachment; filename="robot_map_{ident[:8]}.zip"'})
 
     @app.post('/api/localization/start')
+    @system_change
     def localization_start(data: dict):
-        ensure_stationary()
-        ident = str(data.get('map_id', ''))
-        record = store.map(ident)
-        yaml_path = (store.root / 'maps' / ident / 'map.yaml').resolve()
-        # Do not let a transient /map from the previous SLAM/localization
-        # session masquerade as the map just selected. The new map_server will
-        # repopulate this observation cache through transient-local QoS.
-        ros.clear_ros_map_observation()
-        result = manager.start_localization(yaml_path, ident, record['name'])
-        store.audit('localization_start', f'{ident}:{record["name"]}')
-        return {'ok': True, 'map': record, **result}
+        with delivery.dispatch_lock:
+            ensure_stationary()
+            ident = str(data.get('map_id', ''))
+            record = store.map(ident)
+            yaml_path = (store.root / 'maps' / ident / 'map.yaml').resolve()
+            # Keep the current observation when a conflicting start is refused.
+            # Delivery dispatch independently verifies all occupancy cells and
+            # geometry, so a previous map cannot authorize a different map.
+            result = manager.start_localization(yaml_path, ident, record['name'])
+            store.audit('localization_start', f'{ident}:{record["name"]}')
+            return {'ok': True, 'map': record, **result}
 
     @app.post('/api/localization/stop')
     def localization_stop():
-        ensure_stationary()
-        result = manager.stop('localization')
         store.audit('localization_stop')
-        return {'ok': True, **result}
+        return system.begin('component_stop', 'localization')
 
     @app.post('/api/localization/initial-pose')
+    @system_change
     def localization_initial_pose(data: dict):
         ensure_stationary()
         ident = str(data.get('map_id', ''))
@@ -460,12 +551,14 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
 
     @app.post('/api/rviz/start')
     def rviz_start():
-        ensure_stationary()
-        return manager.start('rviz')
+        epoch = system.epoch()
+        with delivery.dispatch_lock:
+            ensure_stationary()
+            return system.begin('component_start', 'rviz', expected_epoch=epoch)
 
     @app.post('/api/rviz/stop')
     def rviz_stop():
-        return manager.stop('rviz')
+        return system.begin('component_stop', 'rviz')
 
     @app.get('/api/maps/{ident}/points')
     def points(ident: str): return store.points(ident)
@@ -491,6 +584,7 @@ def create_app(store: Store, ros, motion: MotionLease, manager: ProcessManager, 
     def ports(): return serial_tools.ports()
 
     @app.post('/api/serial/read')
+    @system_change
     def serial_read(data: dict):
         with active_operations:
             ensure_stationary()

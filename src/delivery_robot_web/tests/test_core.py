@@ -114,6 +114,8 @@ def test_stale_and_nan_command():
 def test_motion_health_decisions():
     r=RosAdapter.__new__(RosAdapter);r.config=DEFAULT_CONFIG.copy()
     s={'ros_ok':True,'odom_publishers':1,'cmd_subscribers':1,'other_cmd_publishers':[],
+       'motor_cmd_publishers':['/delivery_robot_cmd_mux'],
+       'motor_cmd_receivers':['/delivery_robot_motor'],
        'odom':{'stamp_age':.05,'receive_age':.06,'valid':True},
        'motor':{'safety_age':.05,'wheel_age':.05,'state':1,'rpm_l':0.,'interlock':1,'bench':False}}
     assert r.motion_ready(s)
@@ -217,9 +219,14 @@ def test_websocket_session(client,auth):
         assert data['motion']['armed'] is False
 
 
-def test_process_ownership(store):
+def test_process_ownership(store, monkeypatch):
     m=MotionLease(store.config);r=OfflineAdapter(store.config,m);pm=ProcessManager(store,r)
-    with pytest.raises(UserError):pm.stop('agent')
+    monkeypatch.setattr(pm.agent, 'snapshot', lambda **kw: {'installed': False, 'running': False})
+    monkeypatch.setattr(pm, 'udp_in_use', lambda port: False)
+    monkeypatch.setattr(pm.agent, 'stop', lambda: pytest.fail('No helper stop for an absent Agent'))
+    monkeypatch.setattr(pm, '_stop_owned_child', lambda process: pytest.fail('No owned process to signal'))
+    result = pm.stop('agent', cascade=False)
+    assert result['ok'] and result['results'][0]['already_stopped']
     with pytest.raises(UserError):pm.start('shell')
     assert pm.status()['agent']['running'] is False
 

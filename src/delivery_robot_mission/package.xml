@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>delivery_robot_mission</name><version>1.0.0</version>
+  <name>delivery_robot_mission</name><version>1.1.0</version>
   <description>Pickup/dropoff mission manager using Nav2 NavigateToPose.</description>
   <maintainer email="tuan@example.com">tuan</maintainer><license>Apache-2.0</license>
   <buildtool_depend>ament_python</buildtool_depend>
